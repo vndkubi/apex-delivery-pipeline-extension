@@ -124,7 +124,7 @@ This project includes VS Code Marketplace packaging scripts, but it still needs 
 Before publishing:
 
 1. Replace `publisher: "local-apex"` in `package.json` with your Visual Studio Marketplace publisher id.
-2. Confirm the license. The current package is marked `UNLICENSED`, which is fine for local/private experiments but should be reviewed before public distribution.
+2. Confirm that the Marketplace publisher id exists in the Visual Studio Marketplace publisher portal.
 3. Run `npm install`.
 4. Run `npm run compile`.
 5. Run `npm run package` to create a `.vsix`.
@@ -143,3 +143,7 @@ This extension adds the missing VS Code product surface: commands that create th
 ## Positioning Versus `aidlc-extension`
 
 `aidlc-extension` is a fuller SDLC tracker with a stronger Claude/MCP-oriented workflow. This project is an APEX delivery cockpit: it keeps the file-based workflow visible in VS Code, uses spec-kit artifacts for implementation traceability, and uses Copilot bootstrap assets to make AI-assisted delivery repeatable across implementation, review, verification, and learning.
+
+## License
+
+MIT

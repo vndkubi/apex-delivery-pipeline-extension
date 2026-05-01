@@ -40,7 +40,7 @@ Publishing the extension to the VS Code Marketplace lets users install and updat
 - A Microsoft account with access to the Visual Studio Marketplace publisher.
 - A Marketplace Personal Access Token with **Marketplace > Manage** permission.
 - A real `publisher` value in `package.json`; replace `local-apex` before publishing.
-- A reviewed license decision; `UNLICENSED` is acceptable for local/private use but should be changed before public distribution.
+- MIT license accepted for public distribution.
 - README, icon, categories, and extension description reviewed for public users.
 
 ### Skills / Training Needed
@@ -69,9 +69,9 @@ Expected output sample:
 ```markdown
 ## Blockers
 - package.json publisher is still local-apex; replace with real Marketplace publisher id.
-- license is UNLICENSED; confirm whether this is private-only or choose a public license.
 
 ## Ready
+- License is MIT.
 - Commands are contributed under APEX Delivery.
 - README explains quick start and MCP setup.
 ```
@@ -204,6 +204,14 @@ Quality Checkpoint: Gate 2. Marketplace packaging must behave the same as local 
 ### Step 7: Create or Verify Publisher
 
 Action: Create or verify the Visual Studio Marketplace publisher id.
+
+The `publisher` in `package.json` is the Marketplace publisher id, not the extension display name and not necessarily your GitHub username. Get it from the Visual Studio Marketplace publisher portal:
+
+1. Open `https://marketplace.visualstudio.com/manage` and sign in with the Microsoft account that will own the extension.
+2. Create a new publisher if one does not exist.
+3. Choose a globally unique publisher id, for example `vndkubi` if it is available.
+4. Copy that exact id into `package.json` as `publisher`.
+5. Use the same id for `npx vsce login <publisher-id>`.
 
 Example prompt:
 

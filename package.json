@@ -4,7 +4,7 @@
   "description": "A VS Code extension for APEX delivery epics, spec-kit workspaces, Copilot bootstrap packs, MCP setup, and ROI-ready workflow status.",
   "version": "0.2.0",
   "publisher": "local-apex",
-  "license": "UNLICENSED",
+  "license": "MIT",
   "repository": {
     "type": "git",
     "url": "https://github.com/vndkubi/apex-delivery-pipeline-extension.git"
