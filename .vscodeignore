@@ -1,0 +1,9 @@
+.vscode/**
+.copilot/**
+src/**
+node_modules/**
+out/**/*.map
+*.vsix
+tsconfig.json
+package-lock.json
+npm-debug.log

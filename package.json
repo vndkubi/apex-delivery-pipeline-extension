@@ -1,0 +1,188 @@
+{
+  "name": "apex-delivery-pipeline",
+  "displayName": "APEX Delivery Pipeline",
+  "description": "A VS Code extension for APEX delivery epics, spec-kit workspaces, Copilot bootstrap packs, MCP setup, and ROI-ready workflow status.",
+  "version": "0.2.0",
+  "publisher": "local-apex",
+  "license": "UNLICENSED",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/vndkubi/apex-delivery-pipeline-extension.git"
+  },
+  "homepage": "https://github.com/vndkubi/apex-delivery-pipeline-extension#readme",
+  "bugs": {
+    "url": "https://github.com/vndkubi/apex-delivery-pipeline-extension/issues"
+  },
+  "engines": {
+    "vscode": "^1.85.0"
+  },
+  "categories": [
+    "Other"
+  ],
+  "activationEvents": [
+    "workspaceContains:docs/ai-delivery/epics",
+    "onStartupFinished"
+  ],
+  "main": "./out/extension.js",
+  "contributes": {
+    "viewsContainers": {
+      "activitybar": [
+        {
+          "id": "apex-delivery",
+          "title": "APEX Delivery",
+          "icon": "media/pipeline-icon.svg"
+        }
+      ]
+    },
+    "views": {
+      "apex-delivery": [
+        {
+          "id": "apexDeliveryView",
+          "name": "Delivery Pipeline",
+          "icon": "media/pipeline-icon.svg"
+        }
+      ]
+    },
+    "viewsWelcome": [
+      {
+        "view": "apexDeliveryView",
+        "contents": "No AI delivery epics found.\n\nCreate a file-based sample workflow to try the pipeline.\n[Create Sample Epic](command:apexDelivery.createSampleEpic)\n\nCreate a spec-kit workspace and Copilot operating pack.\n[Start Integrated Delivery Flow](command:apexDelivery.startIntegratedFlow)\n\nConnect Jira, Confluence, or your own MCP server.\n[Configure MCP](command:apexDelivery.configureMcp)\n\nAlready have epics? Set `apexDelivery.epicsPath` in workspace settings and refresh."
+      }
+    ],
+    "configuration": {
+      "title": "APEX Delivery Pipeline",
+      "properties": {
+        "apexDelivery.epicsPath": {
+          "type": "string",
+          "default": "docs/ai-delivery/epics",
+          "description": "Relative path from workspace root to the AI delivery epics folder."
+        },
+        "apexDelivery.specsPath": {
+          "type": "string",
+          "default": "specs",
+          "description": "Relative path from workspace root to spec-kit feature workspaces."
+        },
+        "apexDelivery.ownerName": {
+          "type": "string",
+          "default": "APEX Owner",
+          "description": "Default owner written into sample artifacts and phase status notes."
+        },
+        "apexDelivery.mcpConfigPath": {
+          "type": "string",
+          "default": ".vscode/mcp.json",
+          "description": "Workspace MCP configuration file used for Jira, Confluence, and custom MCP server entries."
+        }
+      }
+    },
+    "commands": [
+      {
+        "command": "apexDelivery.refresh",
+        "title": "Refresh Pipeline Status",
+        "icon": "$(refresh)",
+        "category": "APEX Delivery"
+      },
+      {
+        "command": "apexDelivery.openDashboard",
+        "title": "Open Pipeline Dashboard",
+        "icon": "$(dashboard)",
+        "category": "APEX Delivery"
+      },
+      {
+        "command": "apexDelivery.createSampleEpic",
+        "title": "Create Sample Epic",
+        "icon": "$(add)",
+        "category": "APEX Delivery"
+      },
+      {
+        "command": "apexDelivery.openOrCreateArtifact",
+        "title": "Open or Create Artifact",
+        "icon": "$(file-add)",
+        "category": "APEX Delivery"
+      },
+      {
+        "command": "apexDelivery.advancePhase",
+        "title": "Mark Phase Passed",
+        "icon": "$(pass-filled)",
+        "category": "APEX Delivery"
+      },
+      {
+        "command": "apexDelivery.configureMcp",
+        "title": "Configure MCP Server",
+        "icon": "$(plug)",
+        "category": "APEX Delivery"
+      },
+      {
+        "command": "apexDelivery.createSpecKitWorkspace",
+        "title": "Create Spec Kit Workspace",
+        "icon": "$(symbol-structure)",
+        "category": "APEX Delivery"
+      },
+      {
+        "command": "apexDelivery.createCopilotBootstrapPack",
+        "title": "Create Copilot Bootstrap Pack",
+        "icon": "$(sparkle)",
+        "category": "APEX Delivery"
+      },
+      {
+        "command": "apexDelivery.startIntegratedFlow",
+        "title": "Start Integrated Delivery Flow",
+        "icon": "$(run-all)",
+        "category": "APEX Delivery"
+      }
+    ],
+    "menus": {
+      "view/title": [
+        {
+          "command": "apexDelivery.createSampleEpic",
+          "when": "view == apexDeliveryView && apexDelivery.empty",
+          "group": "navigation@0"
+        },
+        {
+          "command": "apexDelivery.refresh",
+          "when": "view == apexDeliveryView",
+          "group": "navigation@1"
+        },
+        {
+          "command": "apexDelivery.openDashboard",
+          "when": "view == apexDeliveryView",
+          "group": "navigation@2"
+        },
+        {
+          "command": "apexDelivery.configureMcp",
+          "when": "view == apexDeliveryView",
+          "group": "navigation@3"
+        },
+        {
+          "command": "apexDelivery.startIntegratedFlow",
+          "when": "view == apexDeliveryView",
+          "group": "navigation@4"
+        }
+      ],
+      "view/item/context": [
+        {
+          "command": "apexDelivery.openOrCreateArtifact",
+          "when": "view == apexDeliveryView && viewItem =~ /^phase/",
+          "group": "inline@0"
+        },
+        {
+          "command": "apexDelivery.advancePhase",
+          "when": "view == apexDeliveryView && viewItem =~ /^phase/",
+          "group": "inline@1"
+        }
+      ]
+    }
+  },
+  "scripts": {
+    "vscode:prepublish": "npm run compile",
+    "compile": "tsc -p ./",
+    "watch": "tsc -watch -p ./",
+    "package": "vsce package",
+    "publish": "vsce publish"
+  },
+  "devDependencies": {
+    "@types/node": "^20.0.0",
+    "@types/vscode": "^1.85.0",
+    "@vscode/vsce": "^2.15.0",
+    "typescript": "^5.3.0"
+  }
+}
