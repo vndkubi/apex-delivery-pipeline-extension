@@ -2,7 +2,7 @@
   "name": "apex-delivery-pipeline-v1",
   "displayName": "APEX Delivery Pipeline for Copilot",
   "description": "A Copilot-first VS Code extension for APEX delivery epics, direct model runs, @apex chat follow-ups, MCP setup, and ROI-ready workflow status.",
-  "version": "0.4.0",
+  "version": "0.5.2",
   "publisher": "vndkubi",
   "license": "MIT",
   "repository": {
@@ -260,6 +260,15 @@
           "minimum": 0,
           "description": "Default retry limit for guided autopilot phases when the workflow snapshot does not set a retryLimit explicitly."
         },
+        "apexDelivery.autopilot.executionMode": {
+          "type": "string",
+          "default": "agent-pause",
+          "enum": [
+            "agent-pause",
+            "fully-automatic"
+          ],
+          "description": "Controls how Guided Autopilot executes non-interactive phases. 'agent-pause' launches Copilot agent mode and pauses for manual resume; 'fully-automatic' skips chat-based paths and only continues when direct model execution completes observably."
+        },
         "apexDelivery.autopilot.pauseOnManualIntervention": {
           "type": "boolean",
           "default": true,
@@ -339,6 +348,12 @@
         "command": "apexDelivery.runGuidedAutopilot",
         "title": "Run Guided Autopilot",
         "icon": "$(run-all)",
+        "category": "APEX Delivery"
+      },
+      {
+        "command": "apexDelivery.runFullyAutomaticAutopilot",
+        "title": "Run Fully Automatic Autopilot",
+        "icon": "$(debug-start)",
         "category": "APEX Delivery"
       },
       {
@@ -423,12 +438,42 @@
           "group": "navigation@5"
         },
         {
-          "command": "apexDelivery.configurePhaseProfile",
+          "command": "apexDelivery.runGuidedAutopilot",
           "when": "view == apexDeliveryView",
           "group": "navigation@6"
+        },
+        {
+          "command": "apexDelivery.runFullyAutomaticAutopilot",
+          "when": "view == apexDeliveryView",
+          "group": "navigation@7"
+        },
+        {
+          "command": "apexDelivery.configurePhaseProfile",
+          "when": "view == apexDeliveryView",
+          "group": "navigation@8"
         }
       ],
       "view/item/context": [
+        {
+          "command": "apexDelivery.runGuidedAutopilot",
+          "when": "view == apexDeliveryView && viewItem == epic",
+          "group": "navigation@0"
+        },
+        {
+          "command": "apexDelivery.runFullyAutomaticAutopilot",
+          "when": "view == apexDeliveryView && viewItem == epic",
+          "group": "navigation@1"
+        },
+        {
+          "command": "apexDelivery.pauseGuidedAutopilot",
+          "when": "view == apexDeliveryView && viewItem == epic",
+          "group": "navigation@2"
+        },
+        {
+          "command": "apexDelivery.resumeGuidedAutopilot",
+          "when": "view == apexDeliveryView && viewItem == epic",
+          "group": "navigation@3"
+        },
         {
           "command": "apexDelivery.runPhaseInCopilot",
           "when": "view == apexDeliveryView && viewItem =~ /^phase/",
@@ -478,6 +523,11 @@
           "command": "apexDelivery.runGuidedAutopilot",
           "when": "view == apexDeliveryView && viewItem =~ /^phase/",
           "group": "navigation@1"
+        },
+        {
+          "command": "apexDelivery.runFullyAutomaticAutopilot",
+          "when": "view == apexDeliveryView && viewItem =~ /^phase/",
+          "group": "navigation@2"
         }
       ]
     }

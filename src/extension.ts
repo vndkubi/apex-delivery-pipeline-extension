@@ -20,7 +20,7 @@ import {
   upsertMcpServer,
 } from './mcpConfigurator';
 import { DEFAULT_PHASES, EpicStatus, PhaseStatus, phaseDefinitionById } from './pipelineModel';
-import { PipelineProvider } from './pipelineProvider';
+import { EpicItem, PhaseItem, PipelineProvider } from './pipelineProvider';
 import { PipelineScanner, writePhaseStatus } from './pipelineScanner';
 import { resolveRolePolicy, type RolePolicyResolution } from './rolePolicy';
 import { createSpecKitWorkspace } from './specKitWorkspace';
@@ -42,7 +42,10 @@ interface PhaseCommandArgs {
 interface PhaseCommandOptions {
   nonInteractive: boolean;
   forceChatFallback: boolean;
+  autopilotExecutionMode: GuidedAutopilotExecutionMode;
 }
+
+type GuidedAutopilotExecutionMode = 'agent-pause' | 'fully-automatic';
 
 interface CreateSampleEpicCommandOptions {
   nonInteractive: boolean;
@@ -126,7 +129,7 @@ type DirectPhaseRunResult =
   };
 
 interface PhaseCommandResult {
-  mode: 'direct' | 'chat-fallback';
+  mode: 'agent-chat' | 'direct' | 'chat-fallback' | 'blocked';
   artifactPath: string;
   modelLabel?: string;
   responseText?: string;
@@ -196,6 +199,7 @@ export function activate(context: vscode.ExtensionContext): void {
   const templateRoot = path.join(context.extensionPath, 'templates', 'generic');
   const scanner = new PipelineScanner(workspaceRoot, getEpicsPath());
   const provider = new PipelineProvider(scanner);
+  let lastAutopilotTreeTarget: PhaseCommandArgs | undefined;
   let lastPhaseSession: PhaseSessionContext | undefined;
   const statusBar = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Left, 50);
   statusBar.command = 'apexDelivery.openDashboard';
@@ -213,6 +217,28 @@ export function activate(context: vscode.ExtensionContext): void {
     scanner.setEpicsPath(getEpicsPath());
     provider.refresh();
     updateStatusBar(statusBar, provider.getEpics());
+  };
+
+  const resolveAutopilotCommandTarget = (first: unknown, second?: EpicStatus): PhaseCommandArgs => {
+    const directTarget = resolveAutopilotTarget(first, second);
+    if (directTarget.phase && directTarget.epic) {
+      return directTarget;
+    }
+
+    if (lastAutopilotTreeTarget?.phase && lastAutopilotTreeTarget.epic) {
+      return lastAutopilotTreeTarget;
+    }
+
+    const epics = provider.getEpics();
+    if (epics.length === 1) {
+      const [epic] = epics;
+      const phase = epic?.phases[epic.currentPhaseIndex];
+      if (epic && phase) {
+        return { phase, epic };
+      }
+    }
+
+    return directTarget;
   };
 
   let artifactWatcher: vscode.FileSystemWatcher | undefined;
@@ -241,8 +267,25 @@ export function activate(context: vscode.ExtensionContext): void {
     }
   };
 
-  const treeRegistration = vscode.window.registerTreeDataProvider('apexDeliveryView', provider);
-  context.subscriptions.push(treeRegistration);
+  const treeView = vscode.window.createTreeView('apexDeliveryView', { treeDataProvider: provider });
+  context.subscriptions.push(treeView);
+  context.subscriptions.push(treeView.onDidChangeSelection(({ selection }) => {
+    const selectedNode = selection[0];
+    if (selectedNode instanceof PhaseItem) {
+      lastAutopilotTreeTarget = { phase: selectedNode.phase, epic: selectedNode.epic };
+      return;
+    }
+
+    if (selectedNode instanceof EpicItem) {
+      lastAutopilotTreeTarget = {
+        epic: selectedNode.epic,
+        phase: selectedNode.epic.phases[selectedNode.epic.currentPhaseIndex],
+      };
+      return;
+    }
+
+    lastAutopilotTreeTarget = undefined;
+  }));
 
   const participant = vscode.chat.createChatParticipant(APEX_CHAT_PARTICIPANT_ID, async (request, _chatContext, stream, token) => {
     if (!lastPhaseSession) {
@@ -351,9 +394,12 @@ export function activate(context: vscode.ExtensionContext): void {
       return;
     }
 
-    if (!options.nonInteractive && !options.forceChatFallback) {
+    const shouldAttemptAgentLaunch = !options.forceChatFallback
+      && (!options.nonInteractive || options.autopilotExecutionMode === 'agent-pause');
+
+    if (shouldAttemptAgentLaunch) {
       const agentPrompt = buildCopilotAgentStarter(session, runPreferences);
-      const chatLaunchResult = await launchPhaseInCopilotAgent(session, output, runPreferences);
+      const chatLaunchResult = await launchPhaseInCopilotAgent(session, output, runPreferences, options.nonInteractive);
       if (chatLaunchResult !== 'unavailable') {
         await appendRunTrace(buildPhaseRunTraceEntry(
           session,
@@ -365,10 +411,24 @@ export function activate(context: vscode.ExtensionContext): void {
           preferredAgentStatus,
           executionResolution.rolePolicyResolution,
         ));
+        if (options.nonInteractive) {
+          return {
+            mode: 'agent-chat',
+            artifactPath: phase.artifactPath,
+            chatStarter: agentPrompt,
+            chatLaunchResult,
+            verification: verificationEvidence.records,
+            preferredAgentStatus,
+            runPreferences,
+            rolePolicyResolution: executionResolution.rolePolicyResolution,
+          } satisfies PhaseCommandResult;
+        }
         return;
       }
 
       output.appendLine(`[Copilot] Agent-mode chat launch was unavailable for ${epic.key} / ${phase.id}; falling back to direct model execution.`);
+    } else if (!options.forceChatFallback && options.nonInteractive && options.autopilotExecutionMode === 'fully-automatic') {
+      output.appendLine(`[Copilot] Fully automatic mode enabled for ${epic.key} / ${phase.id}; skipping Copilot agent mode and requiring direct completion.`);
     }
 
     if (options.forceChatFallback) {
@@ -435,6 +495,32 @@ export function activate(context: vscode.ExtensionContext): void {
         await continuePhaseInChat(session);
       }
       return;
+    }
+
+    if (options.nonInteractive && options.autopilotExecutionMode === 'fully-automatic' && !options.forceChatFallback) {
+      const reason = `Fully automatic mode could not continue because direct model execution is unavailable: ${directRun.reason}`;
+      output.appendLine(`[Copilot] ${reason}`);
+      await appendRunTrace(buildPhaseRunTraceEntry(
+        session,
+        'direct-model',
+        'Direct model execution was unavailable in fully automatic mode.',
+        directPrompt,
+        contextFiles,
+        verificationEvidence.records,
+        preferredAgentStatus,
+        executionResolution.rolePolicyResolution,
+        undefined,
+        reason,
+      ));
+      return {
+        mode: 'blocked',
+        artifactPath: phase.artifactPath,
+        fallbackReason: reason,
+        verification: verificationEvidence.records,
+        preferredAgentStatus,
+        runPreferences,
+        rolePolicyResolution: executionResolution.rolePolicyResolution,
+      } satisfies PhaseCommandResult;
     }
 
     output.appendLine(`[Copilot] Falling back to GitHub Copilot Chat for ${epic.key} / ${phase.id}: ${directRun.reason}`);
@@ -508,7 +594,7 @@ export function activate(context: vscode.ExtensionContext): void {
   }));
 
   context.subscriptions.push(vscode.commands.registerCommand('apexDelivery.runGuidedAutopilot', async (first: unknown, second?: EpicStatus) => {
-    const target = resolveAutopilotTarget(first, second);
+    const target = resolveAutopilotCommandTarget(first, second);
     if (!target.phase || !target.epic) {
       void vscode.window.showWarningMessage('Select a delivery phase or epic first.');
       return;
@@ -527,8 +613,32 @@ export function activate(context: vscode.ExtensionContext): void {
     );
   }));
 
+  context.subscriptions.push(vscode.commands.registerCommand('apexDelivery.runFullyAutomaticAutopilot', async (first: unknown, second?: EpicStatus) => {
+    const target = resolveAutopilotCommandTarget(first, second);
+    if (!target.phase || !target.epic) {
+      void vscode.window.showWarningMessage('Select a delivery phase or epic first.');
+      return;
+    }
+
+    return runGuidedAutopilot(
+      context,
+      target.phase,
+      target.epic,
+      output,
+      refreshPipeline,
+      {
+        ...getPhaseCommandOptions(first),
+        forceChatFallback: false,
+        autopilotExecutionMode: 'fully-automatic',
+      },
+      workspaceRoot,
+      getEpicsPath(),
+      getOwner(),
+    );
+  }));
+
   context.subscriptions.push(vscode.commands.registerCommand('apexDelivery.pauseGuidedAutopilot', async (first: unknown, second?: EpicStatus) => {
-    const target = resolveAutopilotTarget(first, second);
+    const target = resolveAutopilotCommandTarget(first, second);
     if (!target.phase || !target.epic) {
       void vscode.window.showWarningMessage('Select a delivery phase or epic first.');
       return;
@@ -550,7 +660,7 @@ export function activate(context: vscode.ExtensionContext): void {
   }));
 
   context.subscriptions.push(vscode.commands.registerCommand('apexDelivery.resumeGuidedAutopilot', async (first: unknown, second?: EpicStatus) => {
-    const target = resolveAutopilotTarget(first, second);
+    const target = resolveAutopilotCommandTarget(first, second);
     if (!target.epic) {
       void vscode.window.showWarningMessage('Select a delivery epic or phase first.');
       return;
@@ -803,13 +913,27 @@ function getPhaseCommandOptions(value: unknown): PhaseCommandOptions {
     return {
       nonInteractive: (value as { nonInteractive?: unknown }).nonInteractive === true,
       forceChatFallback: (value as { forceChatFallback?: unknown }).forceChatFallback === true,
+      autopilotExecutionMode: parseGuidedAutopilotExecutionMode((value as { autopilotExecutionMode?: unknown }).autopilotExecutionMode)
+        ?? resolveConfiguredGuidedAutopilotExecutionMode(),
     };
   }
 
   return {
     nonInteractive: false,
     forceChatFallback: false,
+    autopilotExecutionMode: resolveConfiguredGuidedAutopilotExecutionMode(),
   };
+}
+
+function parseGuidedAutopilotExecutionMode(value: unknown): GuidedAutopilotExecutionMode | undefined {
+  return value === 'fully-automatic' || value === 'agent-pause'
+    ? value
+    : undefined;
+}
+
+function resolveConfiguredGuidedAutopilotExecutionMode(): GuidedAutopilotExecutionMode {
+  return parseGuidedAutopilotExecutionMode(vscode.workspace.getConfiguration('apexDelivery').get<unknown>('autopilot.executionMode'))
+    ?? 'agent-pause';
 }
 
 function getIntegratedFlowCommandOptions(value: unknown): IntegratedFlowCommandOptions {
@@ -1441,6 +1565,7 @@ async function runGuidedAutopilot(
       epic: currentEpic,
       nonInteractive: true,
       forceChatFallback: options.forceChatFallback,
+      autopilotExecutionMode: options.autopilotExecutionMode,
     });
 
     if (!phaseRun) {
@@ -1465,6 +1590,58 @@ async function runGuidedAutopilot(
 
     attempts += 1;
     lastPhaseRun = phaseRun;
+
+    if (phaseRun.mode === 'blocked') {
+      const reason = phaseRun.fallbackReason ?? `Guided Autopilot could not continue ${currentEpic.key} / ${currentPhase.name} in fully automatic mode.`;
+      await writeGuidedAutopilotState(context.workspaceState, {
+        epicKey: currentEpic.key,
+        workflowId: currentEpic.workflowId,
+        phaseId: currentPhase.id,
+        attempts,
+        status: 'paused',
+        updatedAt: new Date().toISOString(),
+        reason,
+      });
+      output.appendLine(`[Autopilot] ${reason}`);
+      if (!options.nonInteractive) {
+        void vscode.window.showWarningMessage(reason);
+      }
+      return {
+        outcome: 'paused',
+        epicKey: currentEpic.key,
+        phaseId: currentPhase.id,
+        attempts,
+        reason,
+        lastPhaseRun,
+      };
+    }
+
+    if (phaseRun.mode === 'agent-chat') {
+      const reason = phaseRun.chatLaunchResult === 'submitted'
+        ? `Guided Autopilot launched Copilot agent mode for ${currentEpic.key} / ${currentPhase.name}. Resume after the agent finishes updating the artifact.`
+        : `Guided Autopilot opened Copilot agent mode for ${currentEpic.key} / ${currentPhase.name}. Submit or review the agent prompt, then resume after the artifact is updated.`;
+      await writeGuidedAutopilotState(context.workspaceState, {
+        epicKey: currentEpic.key,
+        workflowId: currentEpic.workflowId,
+        phaseId: currentPhase.id,
+        attempts,
+        status: 'paused',
+        updatedAt: new Date().toISOString(),
+        reason,
+      });
+      output.appendLine(`[Autopilot] ${reason}`);
+      if (!options.nonInteractive) {
+        void vscode.window.showInformationMessage(reason);
+      }
+      return {
+        outcome: 'paused',
+        epicKey: currentEpic.key,
+        phaseId: currentPhase.id,
+        attempts,
+        reason,
+        lastPhaseRun,
+      };
+    }
 
     if (!didVerificationPass(phaseRun.verification)) {
       if (attempts <= policy.retryLimit) {
@@ -2431,6 +2608,7 @@ async function launchPhaseInCopilotAgent(
   session: PhaseSessionContext,
   output: vscode.OutputChannel,
   runPreferences: PhaseRunPreferences,
+  nonInteractive: boolean,
 ): Promise<CopilotChatLaunchResult> {
   await vscode.commands.executeCommand('vscode.open', vscode.Uri.file(session.phase.artifactPath));
 
@@ -2456,7 +2634,7 @@ async function launchPhaseInCopilotAgent(
         : `[Copilot] Could not open GitHub Copilot Chat in agent mode for ${session.epic.key} / ${session.phase.id}.`,
   );
 
-  if (chatLaunchResult !== 'unavailable') {
+  if (!nonInteractive && chatLaunchResult !== 'unavailable') {
     void vscode.window.showInformationMessage(
       chatLaunchResult === 'submitted'
         ? `GitHub Copilot Chat submitted the ${session.phase.name} prompt immediately for ${session.epic.key}. The existing phase artifact is open and attached.`
