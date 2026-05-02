@@ -1,13 +1,15 @@
 import * as fs from 'fs';
 import * as path from 'path';
-import { DEFAULT_PHASES } from './pipelineModel';
 import { writePhaseStatus } from './pipelineScanner';
 import { TemplateContext, writeFromTemplate } from './templateRenderer';
+import { WorkflowDefinition, writeWorkflowMetadata } from './workflowModel';
 
 export interface BootstrapResult {
   epicKey: string;
   folderPath: string;
   created: boolean;
+  workflowId: string;
+  workflowName: string;
 }
 
 export function createSampleEpic(
@@ -15,6 +17,7 @@ export function createSampleEpic(
   epicsRelativePath: string,
   templateRoot: string,
   owner: string,
+  workflowDefinition: WorkflowDefinition,
 ): BootstrapResult {
   const epicsDir = path.resolve(workspaceRoot, epicsRelativePath);
   fs.mkdirSync(epicsDir, { recursive: true });
@@ -31,11 +34,14 @@ export function createSampleEpic(
   };
 
   writeFromTemplate(templateRoot, 'EPIC.md', path.join(folderPath, 'EPIC.md'), context);
-  for (const phase of DEFAULT_PHASES) {
+  writeWorkflowMetadata(folderPath, workflowDefinition);
+
+  const firstPhaseId = workflowDefinition.phases[0]?.id;
+  for (const phase of workflowDefinition.phases) {
     writeFromTemplate(templateRoot, phase.artifact, path.join(folderPath, phase.artifact), context);
-    const status = phase.id === 'discover' ? 'in_progress' : 'pending';
-    const note = phase.id === 'discover'
-      ? 'Sample epic created. Start by validating the business problem and baseline.'
+    const status = phase.id === firstPhaseId ? 'in_progress' : 'pending';
+    const note = phase.id === firstPhaseId
+      ? 'Sample epic created. Start with this workflow entry phase.'
       : 'Waiting for upstream phase completion.';
     writePhaseStatus(
       path.join(folderPath, 'phases', phase.id, 'status.json'),
@@ -46,7 +52,13 @@ export function createSampleEpic(
     );
   }
 
-  return { epicKey, folderPath, created: true };
+  return {
+    epicKey,
+    folderPath,
+    created: true,
+    workflowId: workflowDefinition.id,
+    workflowName: workflowDefinition.name,
+  };
 }
 
 function nextEpicKey(epicsDir: string): string {

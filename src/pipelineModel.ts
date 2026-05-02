@@ -11,15 +11,13 @@ export const PHASE_STATUS_VALUES = [
 
 export type PhaseStatusValue = typeof PHASE_STATUS_VALUES[number];
 
-export type PhaseId =
-  | 'discover'
-  | 'specify'
-  | 'design'
-  | 'implement'
-  | 'review'
-  | 'test'
-  | 'release'
-  | 'learn';
+export type PhaseId = string;
+
+export interface PhaseAutopilotPolicy {
+  enabled?: boolean;
+  retryLimit?: number;
+  pauseOnManualIntervention?: boolean;
+}
 
 export interface PhaseDefinition {
   id: PhaseId;
@@ -28,6 +26,7 @@ export interface PhaseDefinition {
   artifact: string;
   gate: 'Gate 1' | 'Gate 2' | 'Gate 3';
   output: string;
+  autopilot?: PhaseAutopilotPolicy;
 }
 
 export interface PhaseStatus {
@@ -40,6 +39,7 @@ export interface PhaseStatus {
   status: PhaseStatusValue;
   gate: PhaseDefinition['gate'];
   output: string;
+  autopilot?: PhaseAutopilotPolicy;
   updatedAt?: string;
   notes?: string;
 }
@@ -48,6 +48,8 @@ export interface EpicStatus {
   key: string;
   title: string;
   folderPath: string;
+  workflowId: string;
+  workflowName: string;
   phases: PhaseStatus[];
   currentPhaseIndex: number;
   progress: number;

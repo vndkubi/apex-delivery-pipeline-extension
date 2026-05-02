@@ -39,7 +39,7 @@ Publishing the extension to the VS Code Marketplace lets users install and updat
 - `@vscode/vsce` installed through project dev dependencies.
 - A Microsoft account with access to the Visual Studio Marketplace publisher.
 - A Marketplace Personal Access Token with **Marketplace > Manage** permission.
-- A real `publisher` value in `package.json`; replace `local-apex` before publishing.
+- `publisher` in `package.json` matches the Marketplace publisher account; this project currently uses `vndkubi`.
 - MIT license accepted for public distribution.
 - README, icon, categories, and extension description reviewed for public users.
 
@@ -68,10 +68,11 @@ Expected output sample:
 
 ```markdown
 ## Blockers
-- package.json publisher is still local-apex; replace with real Marketplace publisher id.
+- package.json publisher does not match the Marketplace publisher id used for `vsce login`.
 
 ## Ready
 - License is MIT.
+- package.json publisher is `vndkubi` and the release account owns that Marketplace publisher.
 - Commands are contributed under APEX Delivery.
 - README explains quick start and MCP setup.
 ```
@@ -210,7 +211,7 @@ The `publisher` in `package.json` is the Marketplace publisher id, not the exten
 1. Open `https://marketplace.visualstudio.com/manage` and sign in with the Microsoft account that will own the extension.
 2. Create a new publisher if one does not exist.
 3. Choose a globally unique publisher id, for example `vndkubi` if it is available.
-4. Copy that exact id into `package.json` as `publisher`.
+4. Copy that exact id into `package.json` as `publisher`; this project is currently set to `vndkubi`.
 5. Use the same id for `npx vsce login <publisher-id>`.
 
 Example prompt:
@@ -223,13 +224,13 @@ Include publisher id, PAT scope, package.json fields, and release approval.
 Expected command:
 
 ```pwsh
-npx vsce login <publisher-id>
+npx vsce login vndkubi
 ```
 
 Expected output sample:
 
 ```text
-Personal Access Token for publisher '<publisher-id>' saved.
+Personal Access Token for publisher 'vndkubi' saved.
 ```
 
 Quality Checkpoint: Gate 3. Confirm the publisher, ownership, and release authority are approved before publishing.
@@ -358,6 +359,7 @@ Rollback options:
 | `vsce` command not found | `@vscode/vsce` not installed | Run `npm install` |
 | `Couldn't detect the repository where this extension is published` | README contains a relative Markdown link, but `package.json` has no public repository URL | Replace the relative README link with plain text, add a real `repository.url`, or package with explicit `--baseContentUrl` and `--baseImagesUrl` values |
 | Publish fails with publisher error | `publisher` does not match Marketplace publisher id | Update `package.json` publisher |
+| `Publisher ID 'local-apex' ... should match ... 'vndkubi'` | The packaged manifest still has `publisher: "local-apex"` or the command is running from an old folder | Confirm `package.json` has `publisher: "vndkubi"`, rerun `npm run package`, and publish from the extension root |
 | Publish fails with auth error | PAT missing Marketplace Manage scope or expired | Create a new PAT and rerun `vsce login` |
 | Package contains unwanted files | `.vscodeignore` is incomplete | Update `.vscodeignore`, rebuild VSIX, inspect again |
 | Extension fails to activate | Compile output missing or main points to wrong file | Run `npm run compile` and confirm `out/extension.js` exists |

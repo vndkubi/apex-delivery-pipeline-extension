@@ -54,7 +54,7 @@ export class PipelineProvider implements vscode.TreeDataProvider<TreeNode> {
 export class EpicItem extends vscode.TreeItem {
   constructor(readonly epic: EpicStatus) {
     super(epic.key, vscode.TreeItemCollapsibleState.Collapsed);
-    this.description = `${epic.progress}% - ${currentPhaseLabel(epic)}`;
+    this.description = `${epic.progress}% - ${currentPhaseLabel(epic)} - ${epic.workflowName}`;
     this.tooltip = new vscode.MarkdownString(buildEpicTooltip(epic));
     this.contextValue = 'epic';
     this.iconPath = iconForEpic(epic);
@@ -106,6 +106,7 @@ function buildEpicTooltip(epic: EpicStatus): string {
     `## ${epic.key}`,
     '',
     `**Title**: ${epic.title}`,
+    `**Workflow**: ${epic.workflowName} (${epic.workflowId})`,
     `**Progress**: ${epic.progress}%`,
     '',
   ];

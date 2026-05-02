@@ -1,9 +1,9 @@
 {
-  "name": "apex-delivery-pipeline",
-  "displayName": "APEX Delivery Pipeline",
-  "description": "A VS Code extension for APEX delivery epics, spec-kit workspaces, Copilot bootstrap packs, MCP setup, and ROI-ready workflow status.",
-  "version": "0.2.0",
-  "publisher": "local-apex",
+  "name": "apex-delivery-pipeline-v1",
+  "displayName": "APEX Delivery Pipeline for Copilot",
+  "description": "A Copilot-first VS Code extension for APEX delivery epics, direct model runs, @apex chat follow-ups, MCP setup, and ROI-ready workflow status.",
+  "version": "0.4.0",
+  "publisher": "vndkubi",
   "license": "MIT",
   "repository": {
     "type": "git",
@@ -19,8 +19,17 @@
   "categories": [
     "Other"
   ],
+  "keywords": [
+    "apex",
+    "delivery",
+    "copilot",
+    "github copilot chat",
+    "mcp",
+    "spec-kit"
+  ],
   "activationEvents": [
     "workspaceContains:docs/ai-delivery/epics",
+    "onChatParticipant:apex-delivery.phase-assistant",
     "onStartupFinished"
   ],
   "main": "./out/extension.js",
@@ -46,7 +55,16 @@
     "viewsWelcome": [
       {
         "view": "apexDeliveryView",
-        "contents": "No AI delivery epics found.\n\nCreate a file-based sample workflow to try the pipeline.\n[Create Sample Epic](command:apexDelivery.createSampleEpic)\n\nCreate a spec-kit workspace and Copilot operating pack.\n[Start Integrated Delivery Flow](command:apexDelivery.startIntegratedFlow)\n\nConnect Jira, Confluence, or your own MCP server.\n[Configure MCP](command:apexDelivery.configureMcp)\n\nAlready have epics? Set `apexDelivery.epicsPath` in workspace settings and refresh."
+        "contents": "No AI delivery epics found.\n\nCreate a file-based sample workflow to try the pipeline.\n[Create Sample Epic](command:apexDelivery.createSampleEpic)\n\nCreate a spec-kit workspace and Copilot operating pack.\n[Start Integrated Delivery Flow](command:apexDelivery.startIntegratedFlow?%5B%7B%22nonInteractive%22%3Atrue%2C%22openSpec%22%3Atrue%7D%5D)\n\nConnect Jira, Confluence, or your own MCP server.\n[Configure MCP](command:apexDelivery.configureMcp)\n\nAlready have epics? Set `apexDelivery.epicsPath` in workspace settings and refresh."
+      }
+    ],
+    "chatParticipants": [
+      {
+        "id": "apex-delivery.phase-assistant",
+        "name": "apex",
+        "fullName": "APEX Delivery",
+        "description": "Continue the current APEX phase with scoped delivery context.",
+        "isSticky": true
       }
     ],
     "configuration": {
@@ -67,10 +85,210 @@
           "default": "APEX Owner",
           "description": "Default owner written into sample artifacts and phase status notes."
         },
+        "apexDelivery.userRole": {
+          "type": "string",
+          "default": "",
+          "description": "Optional current user role used for role-aware routing, for example 'Business Analyst', 'Code Reviewer', or 'Developer'."
+        },
+        "apexDelivery.workflowDefinitions": {
+          "type": "object",
+          "default": {},
+          "markdownDescription": "Optional custom workflow definitions keyed by workflow id. The resolved workflow is snapshotted into epic metadata when a new epic is created.",
+          "additionalProperties": {
+            "type": "object",
+            "required": [
+              "name",
+              "phases"
+            ],
+            "properties": {
+              "name": {
+                "type": "string",
+                "description": "Human-readable workflow name shown in epic creation and trace views."
+              },
+              "phases": {
+                "type": "array",
+                "minItems": 1,
+                "description": "Ordered workflow phase snapshot. Artifact filenames should match available templates.",
+                "items": {
+                  "type": "object",
+                  "required": [
+                    "id",
+                    "name",
+                    "owner",
+                    "artifact",
+                    "gate",
+                    "output"
+                  ],
+                  "properties": {
+                    "id": {
+                      "type": "string",
+                      "description": "Stable phase id used for status tracking and workflow-scoped phase profiles."
+                    },
+                    "name": {
+                      "type": "string",
+                      "description": "Phase label shown in the tree view and trace panel."
+                    },
+                    "owner": {
+                      "type": "string",
+                      "description": "Default owner label shown for the phase."
+                    },
+                    "artifact": {
+                      "type": "string",
+                      "description": "Artifact filename created from the extension templates, for example DISCOVER.md or REVIEW.md."
+                    },
+                    "gate": {
+                      "type": "string",
+                      "enum": [
+                        "Gate 1",
+                        "Gate 2",
+                        "Gate 3"
+                      ],
+                      "description": "Quality gate label displayed in the pipeline tree."
+                    },
+                    "output": {
+                      "type": "string",
+                      "description": "Expected output label displayed for the phase."
+                    },
+                    "autopilot": {
+                      "type": "object",
+                      "description": "Optional guided autopilot policy for the phase.",
+                      "properties": {
+                        "enabled": {
+                          "type": "boolean",
+                          "description": "When true, guided autopilot may run this phase automatically."
+                        },
+                        "retryLimit": {
+                          "type": "number",
+                          "minimum": 0,
+                          "description": "Optional retry limit for this phase before guided autopilot pauses."
+                        },
+                        "pauseOnManualIntervention": {
+                          "type": "boolean",
+                          "description": "When true, guided autopilot pauses if a human intervenes during the phase."
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          }
+        },
         "apexDelivery.mcpConfigPath": {
           "type": "string",
           "default": ".vscode/mcp.json",
           "description": "Workspace MCP configuration file used for Jira, Confluence, and custom MCP server entries."
+        },
+        "apexDelivery.runPhase.autoSubmit": {
+          "type": "boolean",
+          "default": true,
+          "description": "Automatically submit the Run Phase with Copilot prompt when opening GitHub Copilot Chat."
+        },
+        "apexDelivery.runPhase.agentTag": {
+          "type": "string",
+          "default": "",
+          "description": "Optional best-effort agent routing tag added to Run Phase with Copilot prompts, for example '#dev-orchestrator'."
+        },
+        "apexDelivery.runPhase.preferredChatAgent": {
+          "type": "string",
+          "default": "",
+          "description": "Optional human-readable preferred GitHub Copilot Chat agent name, for example 'Business Analyst' or 'Code Reviewer'."
+        },
+        "apexDelivery.runPhase.modelFamily": {
+          "type": "string",
+          "default": "gpt-4.1",
+          "description": "Preferred model family for extension-driven direct execution or direct fallback. GitHub Copilot Chat model selection still follows the active chat UI."
+        },
+        "apexDelivery.runPhase.phaseProfiles": {
+          "type": "object",
+          "default": {},
+          "markdownDescription": "Optional workflow-scoped Run Phase with Copilot overrides keyed by workflow id, then phase id. Legacy flat `phaseId -> override` entries are still read as fallback for backward compatibility.",
+          "additionalProperties": {
+            "type": "object",
+            "additionalProperties": {
+              "type": "object",
+              "properties": {
+                "autoSubmit": {
+                  "type": "boolean",
+                  "description": "Override whether the phase prompt is submitted automatically."
+                },
+                "agentTag": {
+                  "type": "string",
+                  "description": "Optional best-effort agent routing tag added to the submitted prompt for this phase."
+                },
+                "preferredChatAgent": {
+                  "type": "string",
+                  "description": "Optional preferred GitHub Copilot Chat agent name for this phase, for example 'Business Analyst' or 'Code Reviewer'."
+                },
+                "modelFamily": {
+                  "type": "string",
+                  "description": "Preferred model family for extension-driven direct execution or direct fallback for this phase."
+                }
+              }
+            }
+          }
+        },
+        "apexDelivery.runPhase.rolePolicies": {
+          "type": "object",
+          "default": {},
+          "markdownDescription": "Optional role-aware defaults keyed by user role. These policies are applied before explicit phase profile overrides.",
+          "additionalProperties": {
+            "type": "object",
+            "properties": {
+              "autoSubmit": {
+                "type": "boolean",
+                "description": "Default auto-submit behavior for this role."
+              },
+              "agentTag": {
+                "type": "string",
+                "description": "Default agent routing tag for this role."
+              },
+              "preferredChatAgent": {
+                "type": "string",
+                "description": "Default preferred GitHub Copilot Chat agent for this role."
+              },
+              "modelFamily": {
+                "type": "string",
+                "description": "Default direct-execution model family for this role."
+              }
+            }
+          }
+        },
+        "apexDelivery.autopilot.defaultRetryLimit": {
+          "type": "number",
+          "default": 1,
+          "minimum": 0,
+          "description": "Default retry limit for guided autopilot phases when the workflow snapshot does not set a retryLimit explicitly."
+        },
+        "apexDelivery.autopilot.pauseOnManualIntervention": {
+          "type": "boolean",
+          "default": true,
+          "description": "Pause guided autopilot when unsaved manual edits are detected in the active phase artifact."
+        },
+        "apexDelivery.verification.autoAttach": {
+          "type": "boolean",
+          "default": true,
+          "description": "Automatically run build, test, and lint checks when possible and attach their evidence to the current phase artifact."
+        },
+        "apexDelivery.verification.buildCommand": {
+          "type": "string",
+          "default": "",
+          "description": "Optional explicit build command for verification evidence. If empty, the extension auto-detects compile or build scripts from package.json when available."
+        },
+        "apexDelivery.verification.testCommand": {
+          "type": "string",
+          "default": "",
+          "description": "Optional explicit test command for verification evidence. If empty, the extension auto-detects test:smoke or test scripts from package.json when available."
+        },
+        "apexDelivery.verification.lintCommand": {
+          "type": "string",
+          "default": "",
+          "description": "Optional explicit lint command for verification evidence. If empty, the extension auto-detects a lint script from package.json when available."
+        },
+        "apexDelivery.verification.maxOutputChars": {
+          "type": "number",
+          "default": 4000,
+          "description": "Maximum verification output length stored per check in the artifact evidence section and developer trace panel."
         }
       }
     },
@@ -88,6 +306,12 @@
         "category": "APEX Delivery"
       },
       {
+        "command": "apexDelivery.openTracePanel",
+        "title": "Open Developer Trace Panel",
+        "icon": "$(list-tree)",
+        "category": "APEX Delivery"
+      },
+      {
         "command": "apexDelivery.createSampleEpic",
         "title": "Create Sample Epic",
         "icon": "$(add)",
@@ -97,6 +321,42 @@
         "command": "apexDelivery.openOrCreateArtifact",
         "title": "Open or Create Artifact",
         "icon": "$(file-add)",
+        "category": "APEX Delivery"
+      },
+      {
+        "command": "apexDelivery.configurePhaseProfile",
+        "title": "Configure Phase Profile",
+        "icon": "$(settings-gear)",
+        "category": "APEX Delivery"
+      },
+      {
+        "command": "apexDelivery.runPhaseInCopilot",
+        "title": "Run Phase with Copilot",
+        "icon": "$(comment-discussion)",
+        "category": "APEX Delivery"
+      },
+      {
+        "command": "apexDelivery.runGuidedAutopilot",
+        "title": "Run Guided Autopilot",
+        "icon": "$(run-all)",
+        "category": "APEX Delivery"
+      },
+      {
+        "command": "apexDelivery.pauseGuidedAutopilot",
+        "title": "Pause Guided Autopilot",
+        "icon": "$(debug-pause)",
+        "category": "APEX Delivery"
+      },
+      {
+        "command": "apexDelivery.resumeGuidedAutopilot",
+        "title": "Resume Guided Autopilot",
+        "icon": "$(debug-continue)",
+        "category": "APEX Delivery"
+      },
+      {
+        "command": "apexDelivery.proposeArtifactUpdate",
+        "title": "Propose Artifact Update",
+        "icon": "$(diff)",
         "category": "APEX Delivery"
       },
       {
@@ -134,7 +394,7 @@
       "view/title": [
         {
           "command": "apexDelivery.createSampleEpic",
-          "when": "view == apexDeliveryView && apexDelivery.empty",
+          "when": "view == apexDeliveryView",
           "group": "navigation@0"
         },
         {
@@ -148,26 +408,76 @@
           "group": "navigation@2"
         },
         {
-          "command": "apexDelivery.configureMcp",
+          "command": "apexDelivery.openTracePanel",
           "when": "view == apexDeliveryView",
           "group": "navigation@3"
         },
         {
-          "command": "apexDelivery.startIntegratedFlow",
+          "command": "apexDelivery.configureMcp",
           "when": "view == apexDeliveryView",
           "group": "navigation@4"
+        },
+        {
+          "command": "apexDelivery.startIntegratedFlow",
+          "when": "view == apexDeliveryView",
+          "group": "navigation@5"
+        },
+        {
+          "command": "apexDelivery.configurePhaseProfile",
+          "when": "view == apexDeliveryView",
+          "group": "navigation@6"
         }
       ],
       "view/item/context": [
         {
-          "command": "apexDelivery.openOrCreateArtifact",
+          "command": "apexDelivery.runPhaseInCopilot",
           "when": "view == apexDeliveryView && viewItem =~ /^phase/",
           "group": "inline@0"
         },
         {
-          "command": "apexDelivery.advancePhase",
+          "command": "apexDelivery.runGuidedAutopilot",
           "when": "view == apexDeliveryView && viewItem =~ /^phase/",
           "group": "inline@1"
+        },
+        {
+          "command": "apexDelivery.openOrCreateArtifact",
+          "when": "view == apexDeliveryView && viewItem =~ /^phase/",
+          "group": "inline@2"
+        },
+        {
+          "command": "apexDelivery.proposeArtifactUpdate",
+          "when": "view == apexDeliveryView && viewItem =~ /^phase/",
+          "group": "inline@3"
+        },
+        {
+          "command": "apexDelivery.advancePhase",
+          "when": "view == apexDeliveryView && viewItem =~ /^phase/",
+          "group": "inline@4"
+        },
+        {
+          "command": "apexDelivery.configurePhaseProfile",
+          "when": "view == apexDeliveryView && viewItem =~ /^phase/",
+          "group": "inline@5"
+        },
+        {
+          "command": "apexDelivery.pauseGuidedAutopilot",
+          "when": "view == apexDeliveryView && viewItem =~ /^phase/",
+          "group": "inline@6"
+        },
+        {
+          "command": "apexDelivery.resumeGuidedAutopilot",
+          "when": "view == apexDeliveryView && viewItem =~ /^phase/",
+          "group": "inline@7"
+        },
+        {
+          "command": "apexDelivery.runPhaseInCopilot",
+          "when": "view == apexDeliveryView && viewItem =~ /^phase/",
+          "group": "navigation@0"
+        },
+        {
+          "command": "apexDelivery.runGuidedAutopilot",
+          "when": "view == apexDeliveryView && viewItem =~ /^phase/",
+          "group": "navigation@1"
         }
       ]
     }
@@ -176,11 +486,13 @@
     "vscode:prepublish": "npm run compile",
     "compile": "tsc -p ./",
     "watch": "tsc -watch -p ./",
+    "test:smoke": "npm run compile && node ./out/test/runTest.js",
     "package": "vsce package",
     "publish": "vsce publish"
   },
   "devDependencies": {
     "@types/node": "^20.0.0",
+    "@vscode/test-electron": "^2.5.2",
     "@types/vscode": "^1.85.0",
     "@vscode/vsce": "^2.15.0",
     "typescript": "^5.3.0"

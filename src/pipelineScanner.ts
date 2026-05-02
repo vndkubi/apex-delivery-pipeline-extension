@@ -8,6 +8,7 @@ import {
   isCompletedStatus,
   isPhaseStatusValue,
 } from './pipelineModel';
+import { getDefaultWorkflowDefinition, readWorkflowMetadata } from './workflowModel';
 
 interface ParsedEpicKey {
   prefix: string;
@@ -49,7 +50,13 @@ export class PipelineScanner {
 
   scanEpic(key: string): EpicStatus {
     const folderPath = path.join(this.epicsDir, key);
-    const phases = DEFAULT_PHASES.map((definition) => {
+    const workflowMetadata = readWorkflowMetadata(folderPath);
+    if (workflowMetadata.error) {
+      console.warn(`[APEX Delivery] ${workflowMetadata.error}`);
+    }
+
+    const workflow = workflowMetadata.workflow ?? getDefaultWorkflowDefinition();
+    const phases = workflow.phases.map((definition) => {
       const artifactPath = path.join(folderPath, definition.artifact);
       const statusPath = path.join(folderPath, 'phases', definition.id, 'status.json');
       const parsed = this.readPhaseStatus(statusPath);
@@ -64,6 +71,7 @@ export class PipelineScanner {
         status: parsed?.status ?? inferred,
         gate: definition.gate,
         output: definition.output,
+        autopilot: definition.autopilot,
         updatedAt: parsed?.updatedAt,
         notes: parsed?.notes,
       } satisfies PhaseStatus;
@@ -83,6 +91,8 @@ export class PipelineScanner {
       key,
       title: this.extractTitle(folderPath, key),
       folderPath,
+      workflowId: workflow.id,
+      workflowName: workflow.name,
       phases,
       currentPhaseIndex,
       progress,
