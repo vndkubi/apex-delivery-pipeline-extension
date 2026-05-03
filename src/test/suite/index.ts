@@ -1,7 +1,16 @@
 import * as assert from 'assert';
+import { execFileSync } from 'child_process';
 import * as fs from 'fs';
 import * as path from 'path';
 import * as vscode from 'vscode';
+import {
+  createDefaultCoordinationMetadata,
+  parseCoordinationMetadata,
+  readCoordinationMetadata,
+  withPullRequestBinding,
+  withBranchBinding,
+  writeCoordinationMetadata,
+} from '../../coordinationModel';
 import {
   PersistentApexSessionProvider,
   type ApexChatSessionTransport,
@@ -66,6 +75,48 @@ interface GuidedAutopilotResult {
   reason?: string;
 }
 
+interface PortfolioDashboardResult {
+  entries: Array<{
+    epic: {
+      key: string;
+    };
+    worktreeSignal?: {
+      worktreePath: string;
+      dirtyFiles: number;
+    };
+    missingBranchLink: boolean;
+  }>;
+  summary: {
+    activeEpics: number;
+    blockedEpics: number;
+    awaitingReview: number;
+    openPullRequests: number;
+    localWorktrees: number;
+    missingBranchLinks: number;
+  };
+  indexState: 'available' | 'missing' | 'invalid';
+}
+
+interface ReviewPullRequestCommandResult {
+  mode: 'linked-epic' | 'unlinked' | 'blocked';
+  artifactPath?: string;
+  reviewArtifactPath?: string;
+  reviewContextPath?: string;
+  linkedEpicKey?: string;
+  changedFiles: string[];
+  prNumber?: number;
+  executionWorkspacePath?: string;
+  blockedReason?: string;
+}
+
+interface OpenLinkedBranchWorktreeCommandResult {
+  epicKey: string;
+  branchName: string;
+  worktreePath: string;
+  created: boolean;
+  openedInNewWindow: boolean;
+}
+
 export async function run(): Promise<void> {
   const extension = vscode.extensions.getExtension('vndkubi.apex-delivery-pipeline-v1');
   assert.ok(extension, 'Expected APEX extension to be present in the extension host');
@@ -74,6 +125,7 @@ export async function run(): Promise<void> {
   const workspaceRoot = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
   assert.ok(workspaceRoot, 'Expected smoke test workspace to be open');
   seedWorkspacePackageJson(workspaceRoot);
+  initializeGitRepository(workspaceRoot);
 
   const invalidWorkflowDefinitions = parseWorkflowDefinitions({
     'invalid-session-defaults': {
@@ -230,6 +282,55 @@ export async function run(): Promise<void> {
   assert.strictEqual(fileBackedPhase?.output, 'Capture baseline, blockers, and ROI framing.', 'Expected outputRef to resolve file content during workspace workflow parsing.');
   assert.strictEqual(fileBackedPhase?.sessionDefaults?.starterPrompt, 'Ask for source-backed evidence before proposing edits.', 'Expected starterPromptRef to resolve file content during workspace workflow parsing.');
 
+  const invalidCoordinationMetadata = parseCoordinationMetadata({
+    schemaVersion: 1,
+    epicKey: 'APEX-1000',
+    branches: [
+      {
+        role: 'implementation',
+      },
+    ],
+  }, 'coordination metadata');
+  assert.ok(
+    typeof invalidCoordinationMetadata.error === 'string' && /non-empty name/.test(invalidCoordinationMetadata.error),
+    'AC-1: Expected coordination metadata parsing to reject branch bindings without an explicit branch name.',
+  );
+
+  const parsedCoordinationMetadata = parseCoordinationMetadata({
+    schemaVersion: 1,
+    epicKey: 'APEX-1000',
+    branches: [
+      {
+        name: 'feat/checkout-redesign',
+        role: 'implementation',
+        worktreePath: '../repo-checkout-redesign',
+      },
+    ],
+  }, 'coordination metadata');
+  assert.ok(parsedCoordinationMetadata.metadata, 'Expected coordination metadata to parse when branch bindings are explicit.');
+  assert.strictEqual(parsedCoordinationMetadata.metadata?.branches[0]?.name, 'feat/checkout-redesign', 'Expected coordination metadata parsing to preserve the explicit branch binding name.');
+  assert.ok(
+    !Object.prototype.hasOwnProperty.call(parsedCoordinationMetadata.metadata?.branches[0] ?? {}, 'worktreePath'),
+    'AC-5: Expected machine-local branch fields to be stripped from repo-owned coordination metadata.',
+  );
+
+  const linkedCoordinationMetadata = withBranchBinding(
+    createDefaultCoordinationMetadata('APEX-1000'),
+    {
+      name: 'feat/checkout-redesign',
+      role: 'implementation',
+      createdByApex: false,
+      linkedAt: '2026-05-03T09:00:00Z',
+    },
+  );
+  const relinkedCoordinationMetadata = withBranchBinding(linkedCoordinationMetadata, {
+    name: 'feat/checkout-redesign',
+    role: 'review',
+    createdByApex: false,
+  });
+  assert.strictEqual(relinkedCoordinationMetadata.branches.length, 1, 'AC-4: Expected the same branch to keep a single explicit binding when relinked.');
+  assert.strictEqual(relinkedCoordinationMetadata.branches[0]?.role, 'review', 'AC-4: Expected relinking the same branch to replace the existing binding instead of duplicating it.');
+
   const fileBackedDraft = buildWorkflowEditorDraft(fileBackedDefinitions.workflows.filter((workflow) => workflow.source === 'workspace'));
   const serializedFileBackedDraft = serializeWorkflowEditorDraft(fileBackedDraft);
   const serializedFileBackedPhase = (serializedFileBackedDraft['file-backed-workflow'] as { phases: Array<Record<string, unknown>> }).phases[0];
@@ -314,11 +415,12 @@ export async function run(): Promise<void> {
 
   await vscode.workspace.getConfiguration('apexDelivery').update('workflowDefinitions', configuredWorkflows, vscode.ConfigurationTarget.Workspace);
 
+  const initialEpicKeys = new Set(new PipelineScanner(workspaceRoot, 'docs/ai-delivery/epics').scanAll().map((candidate) => candidate.key));
   await vscode.commands.executeCommand('apexDelivery.createSampleEpic', {
     nonInteractive: true,
     workflowId: 'investigate-workflow',
   });
-  const epic = await waitForEpic(workspaceRoot);
+  const epic = await waitForNewEpic(workspaceRoot, initialEpicKeys);
   assert.strictEqual(epic.workflowId, 'investigate-workflow', 'Expected the sample epic to carry the selected workflow id');
   assert.deepStrictEqual(
     epic.phases.map((candidate) => candidate.id),
@@ -484,6 +586,9 @@ export async function run(): Promise<void> {
 
   const scopedSessionLaunches: Array<{ command: string; resource: string }> = [];
   const scopedChatRequests: Array<{ mode?: string; query?: string }> = [];
+  let firstScopedResult: SmokeCommandResult | undefined;
+  let reopenedScopedResult: SmokeCommandResult | undefined;
+  let secondEpicScopedResult: SmokeCommandResult | undefined;
   await withExecuteCommandInterceptor(async (command, args, next) => {
     if ((command === 'workbench.action.chat.openSessionInNewEditorGroup' || command === 'workbench.action.chat.openSessionInEditorGroup') && isChatSessionOpenRequest(args[0])) {
       scopedSessionLaunches.push({ command, resource: args[0].resource.toString() });
@@ -497,19 +602,19 @@ export async function run(): Promise<void> {
 
     return next(command, ...args);
   }, async () => {
-    await vscode.commands.executeCommand<SmokeCommandResult>('apexDelivery.runPhaseInCopilot', {
+    firstScopedResult = await vscode.commands.executeCommand<SmokeCommandResult>('apexDelivery.runPhaseInCopilot', {
       phase,
       epic,
       nonInteractive: true,
       forceChatFallback: true,
     });
-    await vscode.commands.executeCommand<SmokeCommandResult>('apexDelivery.runPhaseInCopilot', {
+    reopenedScopedResult = await vscode.commands.executeCommand<SmokeCommandResult>('apexDelivery.runPhaseInCopilot', {
       phase: sameEpicLaterPhase,
       epic,
       nonInteractive: true,
       forceChatFallback: true,
     });
-    await vscode.commands.executeCommand<SmokeCommandResult>('apexDelivery.runPhaseInCopilot', {
+    secondEpicScopedResult = await vscode.commands.executeCommand<SmokeCommandResult>('apexDelivery.runPhaseInCopilot', {
       phase: staleAutopilotPhase,
       epic: staleAutopilotEpic,
       nonInteractive: true,
@@ -518,7 +623,10 @@ export async function run(): Promise<void> {
   });
 
   assert.strictEqual(scopedSessionLaunches.length, 3, 'Expected each fallback run to open or reveal an epic-scoped native chat session before sending the prompt');
-  assert.strictEqual(scopedChatRequests.length, 3, 'Expected each fallback run to submit one ask-mode Copilot chat request');
+  assert.strictEqual(firstScopedResult?.chatLaunchResult, 'prefilled', 'Expected the first fallback run for an epic to prefill the scoped ask prompt.');
+  assert.strictEqual(reopenedScopedResult?.chatLaunchResult, 'opened', 'AC1: Expected rerunning the same epic after a prior fallback session to reopen that session instead of starting a new ask chat.');
+  assert.strictEqual(secondEpicScopedResult?.chatLaunchResult, 'prefilled', 'Expected a different epic to start with its own prefilled fallback prompt.');
+  assert.strictEqual(scopedChatRequests.length, 2, 'Expected only fresh epic fallback runs to invoke the generic ask-mode Copilot chat command.');
   const firstScopedSessionUri = vscode.Uri.parse(scopedSessionLaunches[0]?.resource ?? '');
   const secondScopedSessionUri = vscode.Uri.parse(scopedSessionLaunches[1]?.resource ?? '');
   const thirdScopedSessionUri = vscode.Uri.parse(scopedSessionLaunches[2]?.resource ?? '');
@@ -530,8 +638,7 @@ export async function run(): Promise<void> {
   assert.strictEqual(scopedSessionLaunches[0]?.resource, scopedSessionLaunches[1]?.resource, 'Expected different phases of the same epic to reuse the same native chat session');
   assert.notStrictEqual(scopedSessionLaunches[0]?.resource, scopedSessionLaunches[2]?.resource, 'Expected a different epic to use a different native chat session');
   assert.ok(scopedChatRequests[0]?.query?.includes(epic.key), 'Expected the first scoped chat request to target the first epic');
-  assert.ok(scopedChatRequests[1]?.query?.includes(epic.key), 'Expected the second scoped chat request to keep targeting the same epic');
-  assert.ok(scopedChatRequests[2]?.query?.includes(staleAutopilotEpic.key), 'Expected the third scoped chat request to target the second epic');
+  assert.ok(scopedChatRequests[1]?.query?.includes(staleAutopilotEpic.key), 'Expected the second scoped chat request to target the second epic after the reopened first-epic session skipped generic ask-mode launch');
 
   await vscode.workspace.getConfiguration('apexDelivery').update('userRole', 'Developer', vscode.ConfigurationTarget.Workspace);
   await vscode.workspace.getConfiguration('apexDelivery').update('runPhase.rolePolicies', {
@@ -582,7 +689,7 @@ export async function run(): Promise<void> {
   assert.strictEqual(result.transportStability, 'best-effort-command', 'Expected fallback execution to report best-effort transport stability');
   assert.ok(typeof result.chatStarter === 'string' && result.chatStarter.includes('APEX_SESSION='), 'Expected fallback execution to prepare an epic-scoped chat starter');
   assert.ok(typeof result.chatStarter === 'string' && !result.chatStarter.includes('@apex'), 'Expected fallback execution to avoid depending on the @apex participant');
-  assert.strictEqual(result.chatLaunchResult, 'prefilled', 'Expected fallback execution to open Copilot Chat with the scoped prompt prefilled but not submitted');
+  assert.strictEqual(result.chatLaunchResult, 'opened', 'AC1: Expected rerunning fallback for the same epic to reopen the existing chat session rather than prefill a new ask chat');
   assert.strictEqual(result.runPreferences?.preferredChatAgent, 'Business Analyst', 'AC2: Expected explicit phase profile overrides to win over workflow and role defaults.');
   assert.strictEqual(result.runPreferences?.agentTag, '#workflow-investigate', 'AC2: Expected workflow defaults to win over role defaults when no explicit phase profile agentTag override exists.');
   assert.strictEqual(result.runPreferences?.modelFamily, 'gpt-4.1', 'AC2: Expected workflow defaults to win over role defaults for model family.');
@@ -592,28 +699,15 @@ export async function run(): Promise<void> {
   assert.strictEqual(result.rolePolicyResolution?.preferredRole, 'Business Analyst', 'Expected the role-aware resolver to record the preferred phase role');
   assert.match(
     result.fallbackReason ?? '',
-    /prefilled via public command integration/i,
-    'Expected fallback execution to report public Copilot Chat prefill integration',
+    /reopened the existing epic-scoped chat session/i,
+    'AC1: Expected fallback execution to report that it reused the stored epic-scoped chat session',
   );
-  assert.ok(fallbackLaunches.length > 0, 'Expected fallback execution to invoke the ask-mode Copilot chat launch command');
-  const [fallbackLaunch] = fallbackLaunches;
-  assert.ok(fallbackLaunch, 'Expected to capture the fallback Copilot chat payload');
-  const fallbackRequest = fallbackLaunch.args[0] as {
-    mode?: string;
-    query?: string;
-    isPartialQuery?: boolean;
-    attachFiles?: readonly vscode.Uri[];
-  };
-  assert.strictEqual(fallbackRequest.mode, 'ask', 'Expected the fallback Copilot chat command to open in ask mode');
-  assert.ok(typeof fallbackRequest.query === 'string' && fallbackRequest.query.includes('APEX_SESSION='), 'Expected the fallback prompt to include the epic session marker');
-  assert.ok(typeof fallbackRequest.query === 'string' && fallbackRequest.query.includes(epic.key), 'Expected the fallback prompt to mention the current epic key');
-  assert.ok(typeof fallbackRequest.query === 'string' && !fallbackRequest.query.includes('@apex'), 'Expected the fallback prompt payload to avoid the @apex participant');
-  assert.ok(typeof fallbackRequest.query === 'string' && fallbackRequest.query.includes('Preferred GitHub Copilot Chat agent: Business Analyst.'), 'AC3: Expected public Chat launches to carry the preferred agent as a best-effort hint.');
-  assert.ok(typeof fallbackRequest.query === 'string' && fallbackRequest.query.includes('#workflow-investigate'), 'AC2: Expected workflow-scoped agentTag defaults to flow into the scoped fallback prompt.');
-  assert.ok(typeof fallbackRequest.query === 'string' && fallbackRequest.query.includes('Preferred model family hint: gpt-4.1.'), 'AC3: Expected public Chat launches to surface model preference only as a best-effort hint.');
-  assert.ok(typeof fallbackRequest.query === 'string' && fallbackRequest.query.includes('Profile override starter prompt.'), 'AC5: Expected workflow-scoped starter prompt content to be included in the chat handoff.');
-  assert.strictEqual(fallbackRequest.isPartialQuery, true, 'Expected the fallback Copilot chat launch to prefill rather than auto-submit');
-  assert.ok(Array.isArray(fallbackRequest.attachFiles) && fallbackRequest.attachFiles.length >= 3, 'Expected ask-mode fallback to attach the phase artifact, epic brief, and status file');
+  assert.strictEqual(fallbackLaunches.length, 0, 'AC1: Expected fallback execution to avoid issuing a generic ask-mode launch when reopening an existing epic-scoped chat session');
+  assert.ok(typeof result.chatStarter === 'string' && result.chatStarter.includes(epic.key), 'Expected the reopened fallback prompt to mention the current epic key');
+  assert.ok(typeof result.chatStarter === 'string' && result.chatStarter.includes('Preferred GitHub Copilot Chat agent: Business Analyst.'), 'AC3: Expected the reopened fallback prompt to preserve the preferred agent hint.');
+  assert.ok(typeof result.chatStarter === 'string' && result.chatStarter.includes('#workflow-investigate'), 'AC2: Expected workflow-scoped agentTag defaults to flow into the reopened fallback prompt.');
+  assert.ok(typeof result.chatStarter === 'string' && result.chatStarter.includes('Preferred model family hint: gpt-4.1.'), 'AC3: Expected the reopened fallback prompt to preserve the model preference hint.');
+  assert.ok(typeof result.chatStarter === 'string' && result.chatStarter.includes('Profile override starter prompt.'), 'AC5: Expected workflow-scoped starter prompt content to remain in the reopened fallback prompt.');
 
   const agentLaunches: Array<{ command: string; args: readonly unknown[] }> = [];
   const agentModeResult = await withExecuteCommandInterceptor(async (command, args, next) => {
@@ -807,6 +901,163 @@ export async function run(): Promise<void> {
   assert.strictEqual(findPhaseStatus(rescannedFullyAutomaticEpic, 'investigate')?.status, 'passed', 'Expected fully automatic mode to mark the current phase as passed after a direct result');
   assert.strictEqual(findPhaseStatus(rescannedFullyAutomaticEpic, 'triage')?.status, 'in_progress', 'Expected fully automatic mode to advance the next phase to in progress');
 
+  checkoutBranch(workspaceRoot, 'main');
+  commitAll(workspaceRoot, 'Smoke baseline for portfolio and PR review');
+
+  checkoutBranch(workspaceRoot, 'feat/linked-review', true);
+  const linkedReviewChangePath = path.join(workspaceRoot, 'docs', 'ai-delivery', 'epics', epic.key, 'IMPLEMENTATION.md');
+  fs.appendFileSync(linkedReviewChangePath, '\nLinked PR review smoke change.\n', 'utf8');
+  commitAll(workspaceRoot, 'Linked PR review change');
+  checkoutBranch(workspaceRoot, 'main');
+  await vscode.commands.executeCommand('apexDelivery.linkBranchToEpic', {
+    nonInteractive: true,
+    branchName: 'feat/linked-review',
+  }, epic);
+  const linkedMetadata = readCoordinationMetadata(epic.folderPath);
+  assert.ok(
+    linkedMetadata.metadata?.branches.some((branch) => branch.name === 'feat/linked-review'),
+    'AC-1: Expected Link Branch To Epic to bind a selected branch without checking it out first.',
+  );
+  const linkedCoordination = withPullRequestBinding(
+    linkedMetadata.metadata ?? createDefaultCoordinationMetadata(epic.key),
+    {
+      provider: 'github',
+      number: 42,
+      url: 'https://github.com/org/repo/pull/42',
+      baseBranch: 'main',
+      headBranch: 'feat/linked-review',
+      author: 'linked-reviewer',
+      linkedAt: '2026-05-03T13:00:00Z',
+    },
+  );
+  writeCoordinationMetadata(epic.folderPath, linkedCoordination, linkedMetadata.raw);
+
+  const blockedPhaseRun = await vscode.commands.executeCommand<SmokeCommandResult>('apexDelivery.runPhaseInCopilot', {
+    phase,
+    epic,
+    nonInteractive: true,
+    forceChatFallback: true,
+  });
+  assert.ok(blockedPhaseRun, 'Expected Run Phase with Copilot to return a result when the linked branch guard blocks execution.');
+  assert.strictEqual(blockedPhaseRun.mode, 'blocked', 'Expected Run Phase with Copilot to block when the current workspace branch does not match the linked branch.');
+  assert.match(blockedPhaseRun.fallbackReason ?? '', /Expected linked branch "feat\/linked-review"/i, 'Expected the blocked phase run to explain the linked-branch mismatch.');
+
+  const missingWorktreeReviewPath = path.join(workspaceRoot, 'docs', 'ai-delivery', 'reviews', 'PR-42', 'REVIEW.md');
+  const blockedLinkedReviewResult = await vscode.commands.executeCommand<ReviewPullRequestCommandResult>('apexDelivery.reviewPullRequest', {
+    nonInteractive: true,
+    prNumber: 42,
+    prUrl: 'https://github.com/org/repo/pull/42',
+    baseBranch: 'main',
+    headBranch: 'feat/linked-review',
+    openArtifact: false,
+  });
+  assert.ok(blockedLinkedReviewResult, 'Expected linked PR review to return a result when blocked for a missing worktree.');
+  assert.strictEqual(blockedLinkedReviewResult.mode, 'blocked', 'Expected linked PR review to block until the linked branch worktree exists.');
+  assert.match(blockedLinkedReviewResult.blockedReason ?? '', /Open Linked Branch Worktree/i, 'Expected blocked linked PR review to direct the user to open the linked branch worktree.');
+  assert.ok(!fs.existsSync(missingWorktreeReviewPath), 'Expected blocked linked PR review to avoid writing review artifacts in the control workspace.');
+
+  const linkedWorktreeOpenRequests: Array<{ folderUri: vscode.Uri; forceNewWindow?: boolean }> = [];
+  const linkedWorktreeResult = await withExecuteCommandInterceptor(async (command, args, next) => {
+    if (command === 'vscode.openFolder' && args[0] instanceof vscode.Uri) {
+      linkedWorktreeOpenRequests.push({
+        folderUri: args[0],
+        forceNewWindow: typeof args[1] === 'boolean' ? args[1] : undefined,
+      });
+      return undefined;
+    }
+
+    return next(command, ...args);
+  }, async () => vscode.commands.executeCommand<OpenLinkedBranchWorktreeCommandResult>('apexDelivery.openLinkedBranchWorktree', {
+    nonInteractive: true,
+    branchName: 'feat/linked-review',
+  }, epic));
+  assert.ok(linkedWorktreeResult, 'Expected the linked branch worktree command to return a result.');
+  assert.strictEqual(linkedWorktreeResult.branchName, 'feat/linked-review', 'Expected the linked worktree command to resolve the requested linked branch.');
+  assert.ok(fs.existsSync(linkedWorktreeResult.worktreePath), 'Expected the linked branch worktree command to create or reuse a local worktree path.');
+  assert.strictEqual(linkedWorktreeOpenRequests.length, 1, 'Expected the linked branch worktree command to request opening the worktree folder.');
+  assert.strictEqual(
+    path.normalize(linkedWorktreeOpenRequests[0]?.folderUri.fsPath ?? '').toLowerCase(),
+    path.normalize(linkedWorktreeResult.worktreePath).toLowerCase(),
+    'Expected the open-folder request to target the resolved linked worktree path.',
+  );
+  assert.strictEqual(linkedWorktreeOpenRequests[0]?.forceNewWindow, true, 'Expected the linked branch worktree command to open the worktree in a new window.');
+
+  const observedWorktreePath = path.join(path.dirname(workspaceRoot), `${path.basename(workspaceRoot)}-observed-worktree`);
+  createGitWorktree(workspaceRoot, observedWorktreePath, 'feat/worktree-observed', 'main');
+  fs.writeFileSync(path.join(observedWorktreePath, 'worktree-note.md'), 'worktree signal\n', 'utf8');
+  const observedWorktreeMetadata = withBranchBinding(
+    createDefaultCoordinationMetadata(fullyAutomaticEpic.key),
+    {
+      name: 'feat/worktree-observed',
+      role: 'implementation',
+      createdByApex: false,
+      linkedAt: '2026-05-03T13:00:00Z',
+    },
+  );
+  writeCoordinationMetadata(fullyAutomaticEpic.folderPath, observedWorktreeMetadata);
+
+  const dashboard = await vscode.commands.executeCommand<PortfolioDashboardResult>('apexDelivery.openDashboard');
+  assert.ok(dashboard, 'Expected the dashboard command to return a portfolio snapshot.');
+  assert.strictEqual(dashboard.indexState, 'missing', 'Expected the dashboard to degrade gracefully when portfolio.json is absent.');
+  assert.ok(dashboard.summary.activeEpics >= 2, 'Expected the portfolio snapshot to include multiple active epics.');
+  assert.ok(dashboard.summary.localWorktrees >= 1, 'Expected the portfolio snapshot to observe at least one local worktree.');
+  const worktreeEntry = dashboard.entries.find((entry) => entry.epic.key === fullyAutomaticEpic.key);
+  assert.ok(worktreeEntry?.worktreeSignal, 'Expected the portfolio snapshot to surface the observed secondary worktree.');
+  assert.strictEqual(
+    path.normalize(worktreeEntry?.worktreeSignal?.worktreePath ?? '').toLowerCase(),
+    path.normalize(observedWorktreePath).toLowerCase(),
+    'Expected the portfolio snapshot to report the observed worktree path for the linked epic.',
+  );
+  assert.strictEqual(worktreeEntry?.worktreeSignal?.dirtyFiles, 1, 'Expected the portfolio snapshot to report the local dirty-file signal for the observed worktree.');
+
+  const linkedReviewResult = await vscode.commands.executeCommand<ReviewPullRequestCommandResult>('apexDelivery.reviewPullRequest', {
+    nonInteractive: true,
+    prNumber: 42,
+    prUrl: 'https://github.com/org/repo/pull/42',
+    baseBranch: 'main',
+    headBranch: 'feat/linked-review',
+    openArtifact: false,
+  });
+  assert.ok(linkedReviewResult, 'Expected linked PR review mode to return an artifact result.');
+  assert.strictEqual(linkedReviewResult.mode, 'linked-epic', 'Expected an explicitly linked PR to resolve to the linked epic review mode.');
+  assert.strictEqual(linkedReviewResult.linkedEpicKey, epic.key, 'Expected linked PR review mode to resolve the epic key from explicit coordination metadata.');
+  assert.strictEqual(
+    path.normalize(linkedReviewResult.executionWorkspacePath ?? '').toLowerCase(),
+    path.normalize(linkedWorktreeResult.worktreePath).toLowerCase(),
+    'Expected linked PR review mode to execute from the linked branch worktree instead of the control workspace.',
+  );
+  assert.ok(linkedReviewResult.reviewArtifactPath && fs.existsSync(linkedReviewResult.reviewArtifactPath), 'Expected linked PR review mode to create the detailed review workspace artifact.');
+  assert.ok(linkedReviewResult.reviewContextPath && fs.existsSync(linkedReviewResult.reviewContextPath), 'Expected linked PR review mode to create review-context.json.');
+  assert.ok(linkedReviewResult.artifactPath && fs.existsSync(linkedReviewResult.artifactPath), 'Expected linked PR review mode to update the epic review artifact inside the linked worktree.');
+  assert.ok(
+    path.normalize(linkedReviewResult.artifactPath ?? '').toLowerCase().startsWith(path.normalize(linkedWorktreeResult.worktreePath).toLowerCase()),
+    'Expected linked PR review mode to write the epic review artifact under the linked worktree root.',
+  );
+  assert.match(fs.readFileSync(linkedReviewResult.reviewArtifactPath ?? '', 'utf8'), /# PR Review - #42/, 'Expected the linked PR review workspace artifact to include the PR heading.');
+  assert.match(fs.readFileSync(linkedReviewResult.artifactPath ?? '', 'utf8'), /APEX:PR-REVIEW:42:START/, 'Expected the linked epic REVIEW.md artifact to embed the PR review section markers.');
+  assert.ok(linkedReviewResult.changedFiles.some((file) => file.endsWith('IMPLEMENTATION.md')), 'Expected linked PR review mode to capture local diff files from base to head.');
+
+  checkoutBranch(workspaceRoot, 'main');
+  checkoutBranch(workspaceRoot, 'feat/unlinked-review', true);
+  fs.appendFileSync(path.join(workspaceRoot, 'README.md'), '\nUnlinked PR review smoke change.\n', 'utf8');
+  commitAll(workspaceRoot, 'Unlinked PR review change');
+  const unlinkedReviewResult = await vscode.commands.executeCommand<ReviewPullRequestCommandResult>('apexDelivery.reviewPullRequest', {
+    nonInteractive: true,
+    prNumber: 77,
+    prUrl: 'https://github.com/org/repo/pull/77',
+    baseBranch: 'main',
+    headBranch: 'feat/unlinked-review',
+    openArtifact: false,
+  });
+  assert.ok(unlinkedReviewResult, 'Expected unlinked PR review mode to return an artifact result.');
+  assert.strictEqual(unlinkedReviewResult.mode, 'unlinked', 'Expected an unlinked PR to create a standalone review workspace.');
+  assert.strictEqual(unlinkedReviewResult.linkedEpicKey, undefined, 'Expected unlinked PR review mode to stay detached from epic context.');
+  const unlinkedArtifactPath = unlinkedReviewResult.artifactPath;
+  assert.ok(unlinkedArtifactPath && fs.existsSync(unlinkedArtifactPath), 'Expected unlinked PR review mode to create the standalone review artifact.');
+  assert.match(unlinkedArtifactPath?.replace(/\\/g, '/') ?? '', /docs\/ai-delivery\/reviews\/PR-77\/REVIEW\.md$/, 'Expected unlinked PR review mode to place the artifact under docs/ai-delivery/reviews/PR-77/.');
+  assert.match(fs.readFileSync(unlinkedArtifactPath ?? '', 'utf8'), /# PR Review - #77/, 'Expected the unlinked review artifact to include the PR heading.');
+  assert.ok(unlinkedReviewResult.changedFiles.some((file) => file.endsWith('README.md')), 'Expected unlinked PR review mode to capture local diff files from base to head.');
+
   await vscode.commands.executeCommand('workbench.action.closeAllEditors');
   console.log(`APEX smoke test passed with mode: ${result.mode} (${result.chatLaunchResult ?? 'unknown'})`);
 }
@@ -855,6 +1106,49 @@ function seedWorkspacePackageJson(workspaceRoot: string): void {
       lint: 'node -e "console.log(\'lint ok\')"',
     },
   }, null, 2));
+}
+
+function initializeGitRepository(workspaceRoot: string): void {
+  if (fs.existsSync(path.join(workspaceRoot, '.git'))) {
+    return;
+  }
+
+  fs.writeFileSync(path.join(workspaceRoot, 'README.md'), '# APEX Smoke Workspace\n', 'utf8');
+  runGit(workspaceRoot, ['init']);
+  runGit(workspaceRoot, ['config', 'user.email', 'apex-smoke@example.com']);
+  runGit(workspaceRoot, ['config', 'user.name', 'APEX Smoke']);
+  runGit(workspaceRoot, ['add', '.']);
+  runGit(workspaceRoot, ['commit', '-m', 'Initial smoke workspace']);
+  runGit(workspaceRoot, ['branch', '-M', 'main']);
+}
+
+function commitAll(workspaceRoot: string, message: string): void {
+  const status = runGit(workspaceRoot, ['status', '--porcelain']).trim();
+  if (status.length === 0) {
+    return;
+  }
+
+  runGit(workspaceRoot, ['add', '.']);
+  runGit(workspaceRoot, ['commit', '-m', message]);
+}
+
+function checkoutBranch(workspaceRoot: string, branchName: string, create = false): void {
+  runGit(workspaceRoot, create ? ['checkout', '-B', branchName] : ['checkout', branchName]);
+}
+
+function createGitWorktree(workspaceRoot: string, worktreePath: string, branchName: string, startPoint: string): void {
+  if (fs.existsSync(worktreePath)) {
+    fs.rmSync(worktreePath, { recursive: true, force: true });
+  }
+  runGit(workspaceRoot, ['worktree', 'add', worktreePath, '-b', branchName, startPoint]);
+}
+
+function runGit(workspaceRoot: string, args: string[]): string {
+  return execFileSync('git', args, {
+    cwd: workspaceRoot,
+    encoding: 'utf8',
+    windowsHide: true,
+  }).trim();
 }
 
 function findPhaseStatus(epic: EpicStatus, phaseId: string): PhaseStatus | undefined {

@@ -1,8 +1,8 @@
 {
   "name": "apex-delivery-pipeline-v1",
   "displayName": "APEX Delivery Pipeline for Copilot",
-  "description": "A Copilot-first VS Code extension for file-based APEX delivery epics, scoped phase runs, workflow editing, MCP setup, and developer traceability.",
-  "version": "0.5.5",
+  "description": "A Copilot-first VS Code extension for file-based APEX delivery epics, scoped phase runs, workflow editing, branch-linked worktrees, PR review artifacts, MCP setup, and developer traceability.",
+  "version": "0.5.6",
   "publisher": "vndkubi",
   "license": "MIT",
   "repository": {
@@ -378,6 +378,36 @@
         "category": "APEX Delivery"
       },
       {
+        "command": "apexDelivery.linkCurrentBranchToEpic",
+        "title": "Link Current Branch To Epic",
+        "icon": "$(git-branch)",
+        "category": "APEX Delivery"
+      },
+      {
+        "command": "apexDelivery.linkBranchToEpic",
+        "title": "Link Branch To Epic",
+        "icon": "$(git-branch)",
+        "category": "APEX Delivery"
+      },
+      {
+        "command": "apexDelivery.openLinkedBranchWorktree",
+        "title": "Open Linked Branch Worktree",
+        "icon": "$(folder-opened)",
+        "category": "APEX Delivery"
+      },
+      {
+        "command": "apexDelivery.reviewPullRequest",
+        "title": "Review Pull Request",
+        "icon": "$(git-pull-request-go-to-changes)",
+        "category": "APEX Delivery"
+      },
+      {
+        "command": "apexDelivery.generatePrReviewArtifact",
+        "title": "Generate PR Review Artifact",
+        "icon": "$(file-code)",
+        "category": "APEX Delivery"
+      },
+      {
         "command": "apexDelivery.openOrCreateArtifact",
         "title": "Open or Create Artifact",
         "icon": "$(file-add)",
@@ -475,6 +505,26 @@
           "group": "navigation@1"
         },
         {
+          "command": "apexDelivery.linkCurrentBranchToEpic",
+          "when": "view == apexDeliveryView",
+          "group": "navigation@1.5"
+        },
+        {
+          "command": "apexDelivery.linkBranchToEpic",
+          "when": "view == apexDeliveryView",
+          "group": "navigation@1.55"
+        },
+        {
+          "command": "apexDelivery.openLinkedBranchWorktree",
+          "when": "view == apexDeliveryView",
+          "group": "navigation@1.57"
+        },
+        {
+          "command": "apexDelivery.reviewPullRequest",
+          "when": "view == apexDeliveryView",
+          "group": "navigation@1.6"
+        },
+        {
           "command": "apexDelivery.openDashboard",
           "when": "view == apexDeliveryView",
           "group": "navigation@2"
@@ -505,6 +555,26 @@
           "command": "apexDelivery.runPhaseInCopilot",
           "when": "view == apexDeliveryView && viewItem =~ /^phase/",
           "group": "inline@0"
+        },
+        {
+          "command": "apexDelivery.linkCurrentBranchToEpic",
+          "when": "view == apexDeliveryView && viewItem == epic",
+          "group": "inline@0"
+        },
+        {
+          "command": "apexDelivery.linkBranchToEpic",
+          "when": "view == apexDeliveryView && viewItem == epic",
+          "group": "inline@0.5"
+        },
+        {
+          "command": "apexDelivery.openLinkedBranchWorktree",
+          "when": "view == apexDeliveryView && viewItem == epic",
+          "group": "inline@0.75"
+        },
+        {
+          "command": "apexDelivery.reviewPullRequest",
+          "when": "view == apexDeliveryView && viewItem == epic",
+          "group": "inline@1"
         },
         {
           "command": "apexDelivery.openOrCreateArtifact",

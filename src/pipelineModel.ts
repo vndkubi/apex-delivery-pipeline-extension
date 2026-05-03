@@ -1,3 +1,5 @@
+import type { CoordinationBranchBinding, CoordinationPullRequestBinding } from './coordinationModel';
+
 export const PHASE_STATUS_VALUES = [
   'pending',
   'in_progress',
@@ -70,6 +72,20 @@ export interface EpicStatus {
   progress: number;
   hasBlocked: boolean;
   hasAwaitingReview: boolean;
+  coordination?: EpicCoordinationStatus;
+}
+
+export interface EpicCoordinationStatus {
+  metadataPath: string;
+  error?: string;
+  mode?: string;
+  baseBranch?: string;
+  team?: string;
+  owner?: string;
+  priority?: string;
+  coordinationStatus?: string;
+  branches: CoordinationBranchBinding[];
+  pullRequests: CoordinationPullRequestBinding[];
 }
 
 export const DEFAULT_PHASES: readonly PhaseDefinition[] = [

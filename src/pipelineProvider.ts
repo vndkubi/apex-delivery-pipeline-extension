@@ -109,6 +109,15 @@ function buildEpicTooltip(epic: EpicStatus): string {
     `**Progress**: ${epic.progress}%`,
     '',
   ];
+  if (epic.coordination?.branches.length) {
+    lines.push(`**Linked branches**: ${epic.coordination.branches.map((branch) => branch.name).join(', ')}`);
+  }
+  if (epic.coordination?.error) {
+    lines.push(`**Coordination**: ${epic.coordination.error}`);
+  }
+  if (epic.coordination?.branches.length || epic.coordination?.error) {
+    lines.push('');
+  }
   for (const phase of epic.phases) {
     lines.push(`- ${phase.name}: ${phase.status}`);
   }

@@ -1,6 +1,7 @@
+import * as path from 'path';
 import * as vscode from 'vscode';
-import { EpicStatus, PhaseStatus } from './pipelineModel';
 import { escapeHtml } from './html';
+import type { PortfolioEpicEntry, PortfolioSnapshot } from './portfolioModel';
 
 export class DashboardPanel {
   private static currentPanel: DashboardPanel | undefined;
@@ -11,10 +12,10 @@ export class DashboardPanel {
     });
   }
 
-  static show(epics: EpicStatus[]): void {
+  static show(snapshot: PortfolioSnapshot): void {
     if (DashboardPanel.currentPanel) {
       DashboardPanel.currentPanel.panel.reveal(vscode.ViewColumn.One);
-      DashboardPanel.currentPanel.update(epics);
+      DashboardPanel.currentPanel.update(snapshot);
       return;
     }
 
@@ -25,19 +26,25 @@ export class DashboardPanel {
       { enableScripts: false, retainContextWhenHidden: true },
     );
     DashboardPanel.currentPanel = new DashboardPanel(panel);
-    DashboardPanel.currentPanel.update(epics);
+    DashboardPanel.currentPanel.update(snapshot);
   }
 
-  private update(epics: EpicStatus[]): void {
-    this.panel.webview.html = this.render(epics);
+  static updateIfVisible(snapshot: PortfolioSnapshot): void {
+    DashboardPanel.currentPanel?.update(snapshot);
   }
 
-  private render(epics: EpicStatus[]): string {
-    const total = epics.length;
-    const completed = epics.filter((epic) => epic.progress === 100).length;
-    const active = epics.filter((epic) => epic.progress > 0 && epic.progress < 100).length;
-    const blocked = epics.filter((epic) => epic.hasBlocked).length;
-    const awaitingReview = epics.filter((epic) => epic.hasAwaitingReview).length;
+  private update(snapshot: PortfolioSnapshot): void {
+    this.panel.webview.html = this.render(snapshot);
+  }
+
+  private render(snapshot: PortfolioSnapshot): string {
+    const total = snapshot.entries.length;
+    const { summary } = snapshot;
+    const indexStateLabel = snapshot.indexState === 'available'
+      ? 'Portfolio index loaded'
+      : snapshot.indexState === 'invalid'
+        ? 'Portfolio index invalid'
+        : 'Portfolio index missing';
 
     return `<!DOCTYPE html>
 <html lang="en">
@@ -68,7 +75,7 @@ export class DashboardPanel {
       var(--vscode-editor-background);
     padding: 28px;
   }
-  .shell { max-width: 1120px; margin: 0 auto; }
+  .shell { max-width: 1200px; margin: 0 auto; }
   .hero {
     display: flex;
     justify-content: space-between;
@@ -84,7 +91,7 @@ export class DashboardPanel {
   }
   .subtitle {
     color: var(--muted);
-    max-width: 680px;
+    max-width: 700px;
     margin: 0;
     line-height: 1.5;
   }
@@ -93,7 +100,7 @@ export class DashboardPanel {
     background: linear-gradient(180deg, rgba(15, 118, 110, 0.16), rgba(8, 47, 73, 0.10));
     border-radius: 18px;
     padding: 14px 16px;
-    min-width: 250px;
+    min-width: 280px;
     color: var(--muted);
   }
   .hero-note strong {
@@ -101,30 +108,53 @@ export class DashboardPanel {
     margin-bottom: 6px;
     color: var(--vscode-foreground);
   }
-  .stats {
+  .hero-note code {
+    font-family: Consolas, 'Courier New', monospace;
+    color: var(--accent);
+  }
+  .stats, .inbox {
     display: grid;
     grid-template-columns: repeat(auto-fit, minmax(160px, 1fr));
     gap: 14px;
     margin-bottom: 22px;
   }
-  .stat, .epic {
+  .stat, .epic, .warning-card, .inbox-card {
     border: 1px solid var(--line);
     border-radius: 22px;
     background: linear-gradient(180deg, rgba(255,255,255,0.04), rgba(255,255,255,0.02));
     backdrop-filter: blur(12px);
   }
-  .stat {
+  .stat, .inbox-card {
     padding: 18px;
   }
-  .stat strong {
+  .stat strong, .inbox-card strong {
     display: block;
     font-size: 28px;
     letter-spacing: -0.04em;
     margin-bottom: 4px;
   }
-  .stat span {
+  .stat span, .inbox-card span {
     color: var(--muted);
     font-size: 13px;
+  }
+  .section-title {
+    margin: 28px 0 12px;
+    font-size: 16px;
+    letter-spacing: -0.02em;
+  }
+  .warning-list {
+    display: grid;
+    gap: 12px;
+    margin-bottom: 22px;
+  }
+  .warning-card {
+    padding: 14px 16px;
+    border-color: rgba(245, 158, 11, 0.34);
+    background: linear-gradient(180deg, rgba(245, 158, 11, 0.12), rgba(120, 53, 15, 0.10));
+  }
+  .warning-card strong {
+    display: block;
+    margin-bottom: 6px;
   }
   .epic-list {
     display: grid;
@@ -150,9 +180,17 @@ export class DashboardPanel {
     color: var(--accent);
     font-weight: 700;
   }
-  .epic-meta {
+  .epic-meta, .epic-details, .signal-list {
     color: var(--muted);
     font-size: 13px;
+    line-height: 1.55;
+  }
+  .epic-details, .signal-list {
+    margin-top: 12px;
+  }
+  .signal-list code {
+    font-family: Consolas, 'Courier New', monospace;
+    color: var(--accent);
   }
   .badges {
     display: flex;
@@ -182,6 +220,11 @@ export class DashboardPanel {
     background: rgba(249, 115, 22, 0.12);
     color: #fdba74;
     border-color: rgba(249, 115, 22, 0.30);
+  }
+  .badge.signal {
+    background: rgba(34, 197, 94, 0.12);
+    color: #86efac;
+    border-color: rgba(34, 197, 94, 0.28);
   }
   .progress-track {
     height: 10px;
@@ -250,23 +293,35 @@ export class DashboardPanel {
   <main class="shell">
     <section class="hero">
       <div>
-        <h1>APEX Delivery Dashboard</h1>
-        <p class="subtitle">A Copilot-first cockpit for file-based epics, phase gates, and spec-driven delivery progress.</p>
+        <h1>APEX Delivery Control Plane</h1>
+        <p class="subtitle">A portfolio and worktree-aware cockpit for explicit epic coordination, local Git signals, and PR review readiness.</p>
       </div>
       <aside class="hero-note">
-        <strong>Live workflow surface</strong>
-        Tree items now auto-refresh when phase artifacts or status files change, so this dashboard stays in sync with the working folder.
+        <strong>${escapeHtml(indexStateLabel)}</strong>
+        <div>Control branch: <code>${escapeHtml(snapshot.controlBranch ?? 'Not configured')}</code></div>
+        <div>Current branch: <code>${escapeHtml(snapshot.currentBranch ?? 'Unavailable')}</code></div>
+        <div>Index path: <code>${escapeHtml(snapshot.indexPath)}</code></div>
       </aside>
     </section>
     <section class="stats">
       <div class="stat"><strong>${total}</strong><span>Total epics</span></div>
-      <div class="stat"><strong>${active}</strong><span>Active now</span></div>
-      <div class="stat"><strong>${completed}</strong><span>Complete</span></div>
-      <div class="stat"><strong>${awaitingReview}</strong><span>Awaiting review</span></div>
-      <div class="stat"><strong>${blocked}</strong><span>Blocked or rejected</span></div>
+      <div class="stat"><strong>${summary.activeEpics}</strong><span>Active now</span></div>
+      <div class="stat"><strong>${summary.openPullRequests}</strong><span>Linked PRs</span></div>
+      <div class="stat"><strong>${summary.localWorktrees}</strong><span>Observed worktrees</span></div>
+      <div class="stat"><strong>${summary.missingBranchLinks}</strong><span>Missing branch links</span></div>
+      <div class="stat"><strong>${summary.stalePhases}</strong><span>Stale phases</span></div>
     </section>
+    <h2 class="section-title">Coordinator Inbox</h2>
+    <section class="inbox">
+      <div class="inbox-card"><strong>${summary.blockedEpics}</strong><span>Blocked epics</span></div>
+      <div class="inbox-card"><strong>${summary.awaitingReview}</strong><span>Awaiting review</span></div>
+      <div class="inbox-card"><strong>${summary.readyForRelease}</strong><span>Ready for release</span></div>
+      <div class="inbox-card"><strong>${summary.missingBranchLinks}</strong><span>Need branch mapping</span></div>
+    </section>
+    ${snapshot.warnings.length > 0 ? `<h2 class="section-title">Warnings</h2><section class="warning-list">${snapshot.warnings.map(renderWarning).join('')}</section>` : ''}
+    <h2 class="section-title">Portfolio Lanes</h2>
     <section class="epic-list">
-      ${epics.length === 0 ? '<div class="empty">No epics found yet. Create a sample epic from the tree view to see the full APEX workflow.</div>' : epics.map(renderEpic).join('')}
+      ${snapshot.entries.length === 0 ? '<div class="empty">No epics found yet. Create a sample epic from the tree view to see the full APEX workflow.</div>' : snapshot.entries.map(renderEpicEntry).join('')}
     </section>
   </main>
 </body>
@@ -274,14 +329,41 @@ export class DashboardPanel {
   }
 }
 
-function renderEpic(epic: EpicStatus): string {
+function renderWarning(warning: string): string {
+  return `<article class="warning-card"><strong>Portfolio fallback</strong><div>${escapeHtml(warning)}</div></article>`;
+}
+
+function renderEpicEntry(entry: PortfolioEpicEntry): string {
+  const { epic } = entry;
   const currentPhase = epic.phases[epic.currentPhaseIndex];
   const badges = [
     `<span class="badge progress">${epic.progress}% complete</span>`,
     currentPhase ? `<span class="badge progress">Now: ${escapeHtml(currentPhase.name)}</span>` : '<span class="badge progress">Workflow complete</span>',
     epic.hasAwaitingReview ? '<span class="badge review">Needs review</span>' : '',
     epic.hasBlocked ? '<span class="badge blocked">Blocked</span>' : '',
+    entry.worktreeSignal ? '<span class="badge signal">Worktree observed</span>' : '',
   ].filter((badge) => badge.length > 0).join('');
+
+  const details = [
+    epic.coordination?.owner ? `Owner: ${escapeHtml(epic.coordination.owner)}` : undefined,
+    epic.coordination?.team ? `Team: ${escapeHtml(epic.coordination.team)}` : undefined,
+    epic.coordination?.priority ? `Priority: ${escapeHtml(epic.coordination.priority)}` : undefined,
+    epic.coordination?.coordinationStatus ? `Coordination: ${escapeHtml(epic.coordination.coordinationStatus)}` : undefined,
+    entry.linkedBranchNames.length > 0 ? `Branches: ${entry.linkedBranchNames.map((branch) => escapeHtml(branch)).join(', ')}` : 'Branches: Not linked yet',
+    `Linked PRs: ${entry.pullRequestCount}`,
+  ].filter((line): line is string => Boolean(line)).join(' · ');
+
+  const signalLines = entry.worktreeSignal
+    ? [
+        `Observed branch: <code>${escapeHtml(entry.worktreeSignal.branchName)}</code>`,
+        `Worktree: <code>${escapeHtml(entry.worktreeSignal.worktreePath)}</code>`,
+        `Dirty files: ${entry.worktreeSignal.dirtyFiles}`,
+        `Last commit: ${escapeHtml(formatTimestamp(entry.worktreeSignal.lastCommitAt))}`,
+        `Branch exists locally: ${entry.worktreeSignal.branchExistsLocally ? 'yes' : 'no'}`,
+        entry.worktreeSignal.current ? 'Current workspace: yes' : 'Current workspace: no',
+        entry.worktreeSignal.error ? `Signal warning: ${escapeHtml(entry.worktreeSignal.error)}` : undefined,
+      ].filter((line): line is string => Boolean(line))
+    : ['No local worktree observed for the linked branches.'];
 
   return `<article class="epic">
     <div class="epic-head">
@@ -292,13 +374,28 @@ function renderEpic(epic: EpicStatus): string {
       <div class="badges">${badges}</div>
     </div>
     <div class="progress-track"><div class="bar" style="width:${epic.progress}%"></div></div>
+    <div class="epic-details">${details}</div>
+    <div class="signal-list">${signalLines.join(' · ')}</div>
     <div class="phases">${epic.phases.map(renderPhase).join('')}</div>
   </article>`;
 }
 
-function renderPhase(phase: PhaseStatus): string {
+function renderPhase(phase: { name: string; owner: string; status: string }): string {
   return `<div class="phase ${escapeHtml(phase.status)}">
     <div class="phase-name">${escapeHtml(phase.name)}</div>
     <div class="status">${escapeHtml(phase.status)}<br>${escapeHtml(phase.owner)}</div>
   </div>`;
+}
+
+function formatTimestamp(value: string | undefined): string {
+  if (!value) {
+    return 'Unavailable';
+  }
+
+  const parsed = new Date(value);
+  if (Number.isNaN(parsed.getTime())) {
+    return value;
+  }
+
+  return `${parsed.toLocaleDateString()} ${parsed.toLocaleTimeString()}`;
 }

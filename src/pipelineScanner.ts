@@ -1,5 +1,6 @@
 import * as fs from 'fs';
 import * as path from 'path';
+import { coordinationMetadataPath, readCoordinationMetadata } from './coordinationModel';
 import {
   DEFAULT_PHASES,
   EpicStatus,
@@ -55,6 +56,17 @@ export class PipelineScanner {
       console.warn(`[APEX Delivery] ${workflowMetadata.error}`);
     }
 
+    const coordinationMetadataResult = readCoordinationMetadata(folderPath);
+    let coordinationMetadata = coordinationMetadataResult.metadata;
+    let coordinationError = coordinationMetadataResult.error;
+    if (coordinationMetadata && coordinationMetadata.epicKey !== key) {
+      coordinationError = `Coordination metadata at ${coordinationMetadataPath(folderPath)} must target epic ${key}, found ${coordinationMetadata.epicKey}.`;
+      coordinationMetadata = undefined;
+    }
+    if (coordinationError) {
+      console.warn(`[APEX Delivery] ${coordinationError}`);
+    }
+
     const workflow = workflowMetadata.workflow ?? getDefaultWorkflowDefinition();
     const phases = workflow.phases.map((definition) => {
       const artifactPath = path.join(folderPath, definition.artifact);
@@ -101,6 +113,18 @@ export class PipelineScanner {
       progress,
       hasBlocked: phases.some((phase) => phase.status === 'blocked' || phase.status === 'rejected'),
       hasAwaitingReview: phases.some((phase) => phase.status === 'awaiting_review'),
+      coordination: {
+        metadataPath: coordinationMetadataPath(folderPath),
+        error: coordinationError,
+        mode: coordinationMetadata?.mode,
+        baseBranch: coordinationMetadata?.baseBranch,
+        team: coordinationMetadata?.team,
+        owner: coordinationMetadata?.owner,
+        priority: coordinationMetadata?.priority,
+        coordinationStatus: coordinationMetadata?.coordinationStatus,
+        branches: coordinationMetadata?.branches ?? [],
+        pullRequests: coordinationMetadata?.pullRequests ?? [],
+      },
     };
   }
 
