@@ -1,5 +1,6 @@
 import * as fs from 'fs';
 import * as path from 'path';
+import { resolvePhaseTemplateRef } from './pipelineModel';
 import { writePhaseStatus } from './pipelineScanner';
 import { TemplateContext, writeFromTemplate } from './templateRenderer';
 import { WorkflowDefinition, writeWorkflowMetadata } from './workflowModel';
@@ -33,12 +34,12 @@ export function createSampleEpic(
     date: new Date().toISOString().slice(0, 10),
   };
 
-  writeFromTemplate(templateRoot, 'EPIC.md', path.join(folderPath, 'EPIC.md'), context);
+  writeFromTemplate(workspaceRoot, templateRoot, 'EPIC.md', path.join(folderPath, 'EPIC.md'), context);
   writeWorkflowMetadata(folderPath, workflowDefinition);
 
   const firstPhaseId = workflowDefinition.phases[0]?.id;
   for (const phase of workflowDefinition.phases) {
-    writeFromTemplate(templateRoot, phase.artifact, path.join(folderPath, phase.artifact), context);
+    writeFromTemplate(workspaceRoot, templateRoot, resolvePhaseTemplateRef(phase), path.join(folderPath, phase.artifact), context);
     const status = phase.id === firstPhaseId ? 'in_progress' : 'pending';
     const note = phase.id === firstPhaseId
       ? 'Sample epic created. Start with this workflow entry phase.'

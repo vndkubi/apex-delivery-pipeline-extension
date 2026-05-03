@@ -6,6 +6,7 @@ export interface GuidedAutopilotState {
   epicKey: string;
   workflowId: string;
   phaseId: string;
+  sessionId?: string;
   attempts: number;
   status: 'running' | 'paused';
   updatedAt: string;

@@ -19,14 +19,26 @@ export interface PhaseAutopilotPolicy {
   pauseOnManualIntervention?: boolean;
 }
 
+export interface PhaseSessionDefaults {
+  autoSubmit?: boolean;
+  agentTag?: string;
+  modelFamily?: string;
+  preferredChatAgent?: string;
+  starterPrompt?: string;
+  starterPromptRef?: string;
+}
+
 export interface PhaseDefinition {
   id: PhaseId;
   name: string;
   owner: string;
   artifact: string;
+  templateRef?: string;
+  outputRef?: string;
   gate: 'Gate 1' | 'Gate 2' | 'Gate 3';
   output: string;
   autopilot?: PhaseAutopilotPolicy;
+  sessionDefaults?: PhaseSessionDefaults;
 }
 
 export interface PhaseStatus {
@@ -34,12 +46,15 @@ export interface PhaseStatus {
   name: string;
   owner: string;
   artifact: string;
+  templateRef?: string;
+  outputRef?: string;
   artifactPath: string;
   statusPath: string;
   status: PhaseStatusValue;
   gate: PhaseDefinition['gate'];
   output: string;
   autopilot?: PhaseAutopilotPolicy;
+  sessionDefaults?: PhaseSessionDefaults;
   updatedAt?: string;
   notes?: string;
 }
@@ -138,4 +153,8 @@ export function phaseDefinitionById(phaseId: PhaseId): PhaseDefinition {
     throw new Error(`Unknown phase: ${phaseId}`);
   }
   return found;
+}
+
+export function resolvePhaseTemplateRef(phase: Pick<PhaseDefinition, 'artifact' | 'templateRef'>): string {
+  return phase.templateRef?.trim() || phase.artifact;
 }

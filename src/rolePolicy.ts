@@ -3,6 +3,7 @@ export interface RunPreferenceFields {
   agentTag?: string;
   modelFamily?: string;
   preferredChatAgent?: string;
+  starterPrompt?: string;
 }
 
 export interface RolePolicyResolution {
@@ -86,6 +87,11 @@ function parseRolePolicyOverride(rawOverride: unknown): RunPreferenceFields {
   const preferredChatAgent = normalizeNonEmptyString(rawOverride.preferredChatAgent);
   if (preferredChatAgent) {
     override.preferredChatAgent = preferredChatAgent;
+  }
+
+  const starterPrompt = normalizeNonEmptyString(rawOverride.starterPrompt);
+  if (starterPrompt) {
+    override.starterPrompt = starterPrompt;
   }
 
   return override;

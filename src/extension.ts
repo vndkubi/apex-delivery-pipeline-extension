@@ -1,7 +1,18 @@
 import { exec as execCallback } from 'child_process';
+import { createHash } from 'crypto';
 import * as fs from 'fs';
 import * as path from 'path';
 import * as vscode from 'vscode';
+import {
+  PersistentApexSessionProvider,
+  type ApexChatLaunchResult,
+  type ApexChatSessionTransport,
+  type ApexDirectModelTransport,
+  type ApexSessionProvider,
+  type ApexSessionRecord,
+  type ApexTransportStability,
+  WorkspaceApexSessionStore,
+} from './apexSessionProvider';
 import { createCopilotBootstrapPack } from './copilotPack';
 import {
   clearGuidedAutopilotState,
@@ -19,7 +30,7 @@ import {
   sanitizeServerName,
   upsertMcpServer,
 } from './mcpConfigurator';
-import { DEFAULT_PHASES, EpicStatus, PhaseStatus, phaseDefinitionById } from './pipelineModel';
+import { DEFAULT_PHASES, EpicStatus, PhaseStatus, phaseDefinitionById, resolvePhaseTemplateRef } from './pipelineModel';
 import { EpicItem, PhaseItem, PipelineProvider } from './pipelineProvider';
 import { PipelineScanner, writePhaseStatus } from './pipelineScanner';
 import { resolveRolePolicy, type RolePolicyResolution } from './rolePolicy';
@@ -28,6 +39,7 @@ import type { SpecKitWorkspaceResult } from './specKitWorkspace';
 import { TemplateContext, writeFromTemplate } from './templateRenderer';
 import { TracePanel } from './tracePanel';
 import type { PhaseRunTraceEntry, VerificationTraceRecord } from './tracePanel';
+import { WorkflowConfigPanel } from './workflowConfigPanel';
 import {
   getDefaultWorkflowDefinition,
   parseWorkflowDefinitions,
@@ -67,6 +79,10 @@ interface PhaseContextFile {
 }
 
 interface PhaseSessionContext {
+  sessionId: string;
+  sessionKey: string;
+  transportId: string;
+  transportStability: ApexTransportStability;
   phase: PhaseStatus;
   epic: EpicStatus;
   workspaceRoot: string;
@@ -78,6 +94,7 @@ interface PhaseRunPreferences {
   agentTag?: string;
   modelFamily?: string;
   preferredChatAgent?: string;
+  starterPrompt?: string;
 }
 
 interface PhaseExecutionResolution {
@@ -115,7 +132,10 @@ interface PreferredChatAgentStatus {
   note?: string;
 }
 
-type CopilotChatLaunchResult = 'submitted' | 'prefilled' | 'opened' | 'unavailable';
+type CopilotChatLaunchResult = ApexChatLaunchResult;
+
+const PHASE_CHAT_SESSION_PATTERN = /\bAPEX_SESSION=([A-Za-z0-9-]+)\b/;
+const PHASE_CHAT_SESSION_URI_SCHEME = 'vscode-chat-session';
 
 type DirectPhaseRunResult =
   | {
@@ -131,6 +151,9 @@ type DirectPhaseRunResult =
 interface PhaseCommandResult {
   mode: 'agent-chat' | 'direct' | 'chat-fallback' | 'blocked';
   artifactPath: string;
+  sessionId?: string;
+  transportId?: string;
+  transportStability?: ApexTransportStability;
   modelLabel?: string;
   responseText?: string;
   fallbackReason?: string;
@@ -200,12 +223,56 @@ export function activate(context: vscode.ExtensionContext): void {
   const scanner = new PipelineScanner(workspaceRoot, getEpicsPath());
   const provider = new PipelineProvider(scanner);
   let lastAutopilotTreeTarget: PhaseCommandArgs | undefined;
-  let lastPhaseSession: PhaseSessionContext | undefined;
+  const phaseSessions = new Map<string, PhaseSessionContext>();
+  let lastPhaseSessionKey: string | undefined;
+  const phaseSessionStore = new WorkspaceApexSessionStore(context.workspaceState);
+  const phaseSessionProvider = new PersistentApexSessionProvider(phaseSessionStore, buildPhaseChatSessionKey);
+  const bestEffortChatTransport: ApexChatSessionTransport = {
+    id: 'best-effort-native-chat',
+    stability: 'best-effort-command',
+    supportsExactSessionTargeting: false,
+    openAsk: (record, payload) => tryStartCopilotChat(record, payload.prompt, payload.autoSubmit, payload.attachFiles),
+    openAgent: (record, payload) => tryStartCopilotAgentChat(record, payload.prompt, payload.attachFiles, payload.autoSubmit),
+  };
+  const directModelTransport: ApexDirectModelTransport<
+    DirectPhaseRunResult,
+    { session: PhaseSessionContext; options: PhaseCommandOptions; runPreferences: PhaseRunPreferences; preferredModelFamily?: string }
+  > = {
+    id: 'copilot-language-model',
+    stability: 'stable-public',
+    supportsExactSessionTargeting: false,
+    run: (_record, payload) => runPhaseWithCopilotModel(
+      context,
+      payload.session,
+      output,
+      payload.options,
+      payload.runPreferences,
+      payload.preferredModelFamily,
+    ),
+  };
   const statusBar = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Left, 50);
   statusBar.command = 'apexDelivery.openDashboard';
   statusBar.tooltip = 'Open APEX Delivery Dashboard';
   context.subscriptions.push(statusBar);
   let runTraceHistory = readStoredRunTraceHistory(context);
+
+  const rememberPhaseSession = (session: PhaseSessionContext): void => {
+    phaseSessions.set(session.sessionKey, session);
+    lastPhaseSessionKey = session.sessionKey;
+  };
+
+  const resolvePhaseSessionForPrompt = (prompt: string): PhaseSessionContext | undefined => {
+    const sessionKey = extractPhaseChatSessionKey(prompt);
+    if (sessionKey) {
+      return phaseSessions.get(sessionKey);
+    }
+
+    if (!lastPhaseSessionKey) {
+      return undefined;
+    }
+
+    return phaseSessions.get(lastPhaseSessionKey);
+  };
 
   const appendRunTrace = async (entry: PhaseRunTraceEntry): Promise<void> => {
     runTraceHistory = [entry, ...runTraceHistory].slice(0, MAX_PHASE_RUN_TRACE_ENTRIES);
@@ -288,19 +355,20 @@ export function activate(context: vscode.ExtensionContext): void {
   }));
 
   const participant = vscode.chat.createChatParticipant(APEX_CHAT_PARTICIPANT_ID, async (request, _chatContext, stream, token) => {
-    if (!lastPhaseSession) {
+    const session = resolvePhaseSessionForPrompt(request.prompt);
+    if (!session) {
       stream.markdown('Run **APEX Delivery: Run Phase with Copilot** on a phase first, then continue here with `@apex`.');
       return;
     }
 
-    stream.progress(`Using ${lastPhaseSession.epic.key} / ${lastPhaseSession.phase.name} context.`);
-    stream.reference(vscode.Uri.file(path.join(lastPhaseSession.epic.folderPath, 'EPIC.md')));
-    stream.reference(vscode.Uri.file(lastPhaseSession.phase.artifactPath));
-    stream.reference(vscode.Uri.file(lastPhaseSession.phase.statusPath));
+    stream.progress(`Using ${session.epic.key} / ${session.phase.name} context.`);
+    stream.reference(vscode.Uri.file(path.join(session.epic.folderPath, 'EPIC.md')));
+    stream.reference(vscode.Uri.file(session.phase.artifactPath));
+    stream.reference(vscode.Uri.file(session.phase.statusPath));
 
     try {
       const response = await request.model.sendRequest(
-        [vscode.LanguageModelChatMessage.User(buildParticipantPrompt(lastPhaseSession, request.prompt))],
+        [vscode.LanguageModelChatMessage.User(buildParticipantPrompt(session, request.prompt))],
         {},
         token,
       );
@@ -358,7 +426,7 @@ export function activate(context: vscode.ExtensionContext): void {
 
     if (!fs.existsSync(phase.artifactPath)) {
       const templateContext = buildTemplateContext(epic, getOwner());
-      writeFromTemplate(templateRoot, phase.artifact, phase.artifactPath, templateContext);
+      writeFromTemplate(workspaceRoot, templateRoot, resolvePhaseTemplateRef(phase), phase.artifactPath, templateContext);
       output.appendLine(`Seeded artifact: ${phase.artifactPath}`);
       refreshPipeline();
     }
@@ -371,6 +439,15 @@ export function activate(context: vscode.ExtensionContext): void {
     await configurePhaseProfile(phase, epic, output);
   }));
 
+  context.subscriptions.push(vscode.commands.registerCommand('apexDelivery.configureWorkflows', () => {
+    WorkflowConfigPanel.show({
+      workspaceRoot,
+      templateRoot,
+      output,
+      onDidSave: refreshPipeline,
+    });
+  }));
+
   context.subscriptions.push(vscode.commands.registerCommand('apexDelivery.runPhaseInCopilot', async (first: unknown, second?: EpicStatus) => {
     const { phase, epic } = unwrapPhaseArgs(first, second);
     const options = getPhaseCommandOptions(first);
@@ -379,15 +456,15 @@ export function activate(context: vscode.ExtensionContext): void {
       return;
     }
 
-    ensurePhaseArtifactExists(phase, epic, templateRoot, getOwner(), output, refreshPipeline);
+    ensurePhaseArtifactExists(phase, epic, workspaceRoot, templateRoot, getOwner(), output, refreshPipeline);
 
-    let session = buildPhaseSessionContext(phase, epic, workspaceRoot);
+  let session = await resolvePhaseSessionContext(phaseSessionProvider, phase, epic, workspaceRoot);
     const verificationEvidence = await attachVerificationEvidence(session, output, options.nonInteractive);
-    session = buildPhaseSessionContext(phase, epic, workspaceRoot);
+  session = await resolvePhaseSessionContext(phaseSessionProvider, phase, epic, workspaceRoot);
     const executionResolution = getPhaseExecutionResolution(epic, phase);
     const runPreferences = executionResolution.runPreferences;
     const preferredAgentStatus = executionResolution.preferredAgentStatus;
-    lastPhaseSession = session;
+    rememberPhaseSession(session);
     const contextFiles = buildTraceContextFiles(session);
     reportPreferredChatAgentStatus(session, preferredAgentStatus, output, options.nonInteractive);
     if (!await confirmRoleRouting(session, executionResolution.rolePolicyResolution, options.nonInteractive)) {
@@ -398,8 +475,23 @@ export function activate(context: vscode.ExtensionContext): void {
       && (!options.nonInteractive || options.autopilotExecutionMode === 'agent-pause');
 
     if (shouldAttemptAgentLaunch) {
+      session = await bindPhaseSessionTransport(
+        phaseSessionProvider,
+        session,
+        bestEffortChatTransport,
+        {
+          resource: buildPhaseChatSessionUri(session).toString(),
+          launchMode: 'agent',
+        },
+      );
       const agentPrompt = buildCopilotAgentStarter(session, runPreferences);
-      const chatLaunchResult = await launchPhaseInCopilotAgent(session, output, runPreferences, options.nonInteractive);
+      const chatLaunchResult = await launchPhaseInCopilotAgent(session, output, bestEffortChatTransport, runPreferences, options.nonInteractive);
+      session = await markPhaseSessionStatus(
+        phaseSessionProvider,
+        session,
+        chatLaunchResult === 'submitted' ? 'submitted' : chatLaunchResult === 'prefilled' || chatLaunchResult === 'opened' ? 'opened' : 'failed',
+        chatLaunchResult === 'unavailable' ? 'Agent-mode chat launch was unavailable.' : undefined,
+      );
       if (chatLaunchResult !== 'unavailable') {
         await appendRunTrace(buildPhaseRunTraceEntry(
           session,
@@ -415,6 +507,7 @@ export function activate(context: vscode.ExtensionContext): void {
           return {
             mode: 'agent-chat',
             artifactPath: phase.artifactPath,
+            ...buildPhaseSessionResultMetadata(session),
             chatStarter: agentPrompt,
             chatLaunchResult,
             verification: verificationEvidence.records,
@@ -433,12 +526,36 @@ export function activate(context: vscode.ExtensionContext): void {
 
     if (options.forceChatFallback) {
       output.appendLine(`[Copilot] Forcing GitHub Copilot Chat fallback for ${epic.key} / ${phase.id}.`);
-      const fallbackResult = await handoffPhaseToCopilotChat(session, output, options);
+      session = await bindPhaseSessionTransport(
+        phaseSessionProvider,
+        session,
+        bestEffortChatTransport,
+        {
+          resource: buildPhaseChatSessionUri(session).toString(),
+          launchMode: 'ask',
+        },
+      );
+      const fallbackResult = await handoffPhaseToCopilotChat(
+        session,
+        output,
+        bestEffortChatTransport,
+        options,
+        buildDraftPhaseRunPreferences(runPreferences),
+      );
+      session = await markPhaseSessionStatus(
+        phaseSessionProvider,
+        session,
+        fallbackResult.chatLaunchResult === 'submitted' ? 'submitted' : fallbackResult.chatLaunchResult === 'prefilled' || fallbackResult.chatLaunchResult === 'opened' ? 'opened' : 'failed',
+        fallbackResult.fallbackReason,
+      );
+      fallbackResult.sessionId = session.sessionId;
+      fallbackResult.transportId = session.transportId;
+      fallbackResult.transportStability = session.transportStability;
       await appendRunTrace(buildPhaseRunTraceEntry(
         session,
         'chat-fallback',
         describeChatLaunchTraceResult(fallbackResult.chatLaunchResult ?? 'unavailable', 'fallback chat'),
-        fallbackResult.chatStarter ?? buildApexChatStarter(session),
+        fallbackResult.chatStarter ?? buildScopedChatStarter(session),
         contextFiles,
         verificationEvidence.records,
         preferredAgentStatus,
@@ -453,8 +570,22 @@ export function activate(context: vscode.ExtensionContext): void {
       return fallbackResult;
     }
 
-    const directPrompt = buildDirectModelPrompt(session);
-    const directRun = await runPhaseWithCopilotModel(context, session, output, options, runPreferences.modelFamily);
+    session = await bindPhaseSessionTransport(phaseSessionProvider, session, directModelTransport, {
+      launchMode: 'direct-model',
+    });
+    const directPrompt = buildDirectModelPrompt(session, runPreferences);
+    const directRun = await directModelTransport.run(sessionToSessionRecord(session), {
+      session,
+      options,
+      runPreferences,
+      preferredModelFamily: runPreferences.modelFamily,
+    });
+    session = await markPhaseSessionStatus(
+      phaseSessionProvider,
+      session,
+      directRun.kind === 'completed' ? 'completed' : 'failed',
+      directRun.kind === 'fallback' ? directRun.reason : undefined,
+    );
     if (directRun.kind === 'completed') {
       output.appendLine(`[Copilot] Direct run complete for ${epic.key} / ${phase.id} using ${formatModelLabel(directRun.model)}.`);
       await appendRunTrace(buildPhaseRunTraceEntry(
@@ -472,6 +603,7 @@ export function activate(context: vscode.ExtensionContext): void {
         return {
           mode: 'direct',
           artifactPath: phase.artifactPath,
+          ...buildPhaseSessionResultMetadata(session),
           modelLabel: formatModelLabel(directRun.model),
           responseText: directRun.responseText,
           verification: verificationEvidence.records,
@@ -492,7 +624,7 @@ export function activate(context: vscode.ExtensionContext): void {
       }
 
       if (choice === 'Continue in Chat') {
-        await continuePhaseInChat(session);
+        await continuePhaseInChat(session, bestEffortChatTransport, runPreferences);
       }
       return;
     }
@@ -515,6 +647,7 @@ export function activate(context: vscode.ExtensionContext): void {
       return {
         mode: 'blocked',
         artifactPath: phase.artifactPath,
+        ...buildPhaseSessionResultMetadata(session),
         fallbackReason: reason,
         verification: verificationEvidence.records,
         preferredAgentStatus,
@@ -524,12 +657,37 @@ export function activate(context: vscode.ExtensionContext): void {
     }
 
     output.appendLine(`[Copilot] Falling back to GitHub Copilot Chat for ${epic.key} / ${phase.id}: ${directRun.reason}`);
-    const fallbackResult = await handoffPhaseToCopilotChat(session, output, options, options.nonInteractive ? undefined : runPreferences);
+    session = await bindPhaseSessionTransport(
+      phaseSessionProvider,
+      session,
+      bestEffortChatTransport,
+      {
+        resource: buildPhaseChatSessionUri(session).toString(),
+        launchMode: 'ask',
+        fallbackReason: directRun.reason,
+      },
+    );
+    const fallbackResult = await handoffPhaseToCopilotChat(
+      session,
+      output,
+      bestEffortChatTransport,
+      options,
+      options.nonInteractive ? buildDraftPhaseRunPreferences(runPreferences) : runPreferences,
+    );
+    session = await markPhaseSessionStatus(
+      phaseSessionProvider,
+      session,
+      fallbackResult.chatLaunchResult === 'submitted' ? 'submitted' : fallbackResult.chatLaunchResult === 'prefilled' || fallbackResult.chatLaunchResult === 'opened' ? 'opened' : 'failed',
+      directRun.reason,
+    );
+    fallbackResult.sessionId = session.sessionId;
+    fallbackResult.transportId = session.transportId;
+    fallbackResult.transportStability = session.transportStability;
     await appendRunTrace(buildPhaseRunTraceEntry(
       session,
       'chat-fallback',
       describeChatLaunchTraceResult(fallbackResult.chatLaunchResult ?? 'unavailable', 'fallback chat'),
-      fallbackResult.chatStarter ?? buildApexChatStarter(session),
+      fallbackResult.chatStarter ?? buildScopedChatStarter(session),
       contextFiles,
       verificationEvidence.records,
       preferredAgentStatus,
@@ -551,14 +709,14 @@ export function activate(context: vscode.ExtensionContext): void {
       return;
     }
 
-    ensurePhaseArtifactExists(phase, epic, templateRoot, getOwner(), output, refreshPipeline);
+    ensurePhaseArtifactExists(phase, epic, workspaceRoot, templateRoot, getOwner(), output, refreshPipeline);
     let session = buildPhaseSessionContext(phase, epic, workspaceRoot);
     const verificationEvidence = await attachVerificationEvidence(session, output, false);
     session = buildPhaseSessionContext(phase, epic, workspaceRoot);
     const executionResolution = getPhaseExecutionResolution(epic, phase);
     const runPreferences = executionResolution.runPreferences;
     const preferredAgentStatus = executionResolution.preferredAgentStatus;
-    lastPhaseSession = session;
+    rememberPhaseSession(session);
     const artifactProposalPrompt = buildArtifactProposalPrompt(session);
     const contextFiles = buildTraceContextFiles(session);
     reportPreferredChatAgentStatus(session, preferredAgentStatus, output, false);
@@ -644,10 +802,12 @@ export function activate(context: vscode.ExtensionContext): void {
       return;
     }
 
+    const sessionRecord = await phaseSessionProvider.getByEpic(target.epic.key);
     const state: GuidedAutopilotState = {
       epicKey: target.epic.key,
       workflowId: target.epic.workflowId,
       phaseId: target.phase.id,
+      sessionId: sessionRecord?.sessionId,
       attempts: readGuidedAutopilotState(context.workspaceState, target.epic.key)?.attempts ?? 0,
       status: 'paused',
       updatedAt: new Date().toISOString(),
@@ -976,16 +1136,19 @@ function getPhaseRunPreferences(
   workflowId: string,
   phaseId: PhaseStatus['id'],
   rolePolicyResolution?: RolePolicyResolution,
+  workflowDefaults?: PhaseStatus['sessionDefaults'],
 ): PhaseRunPreferences {
   const defaults = getWorkspacePhaseRunDefaults();
   const override = getPhaseRunProfileOverride(workflowId, phaseId);
   const roleDefaults = rolePolicyResolution?.preferences ?? {};
 
+  // AC2: explicit profile overrides win, then snapshotted workflow defaults, then role policies, then workspace defaults.
   return {
-    autoSubmit: override?.autoSubmit ?? roleDefaults.autoSubmit ?? defaults.autoSubmit,
-    agentTag: override?.agentTag ?? roleDefaults.agentTag ?? defaults.agentTag,
-    modelFamily: override?.modelFamily ?? roleDefaults.modelFamily ?? defaults.modelFamily,
-    preferredChatAgent: override?.preferredChatAgent ?? roleDefaults.preferredChatAgent ?? defaults.preferredChatAgent,
+    autoSubmit: override?.autoSubmit ?? workflowDefaults?.autoSubmit ?? roleDefaults.autoSubmit ?? defaults.autoSubmit,
+    agentTag: override?.agentTag ?? workflowDefaults?.agentTag ?? roleDefaults.agentTag ?? defaults.agentTag,
+    modelFamily: override?.modelFamily ?? workflowDefaults?.modelFamily ?? roleDefaults.modelFamily ?? defaults.modelFamily,
+    preferredChatAgent: override?.preferredChatAgent ?? workflowDefaults?.preferredChatAgent ?? roleDefaults.preferredChatAgent ?? defaults.preferredChatAgent,
+    starterPrompt: override?.starterPrompt ?? workflowDefaults?.starterPrompt ?? roleDefaults.starterPrompt ?? defaults.starterPrompt,
   };
 }
 
@@ -995,7 +1158,7 @@ function getPhaseExecutionResolution(epic: EpicStatus, phase: PhaseStatus): Phas
     getCurrentUserRole(),
     vscode.workspace.getConfiguration('apexDelivery').get<unknown>('runPhase.rolePolicies', {}),
   );
-  const runPreferences = getPhaseRunPreferences(epic.workflowId, phase.id, rolePolicyResolution);
+  const runPreferences = getPhaseRunPreferences(epic.workflowId, phase.id, rolePolicyResolution, phase.sessionDefaults);
   return {
     runPreferences,
     preferredAgentStatus: resolvePreferredChatAgentStatus(runPreferences),
@@ -1010,6 +1173,7 @@ function getWorkspacePhaseRunDefaults(): PhaseRunPreferences {
     agentTag: normalizeNonEmptyString(config.get<unknown>('runPhase.agentTag')),
     modelFamily: normalizeNonEmptyString(config.get<unknown>('runPhase.modelFamily')),
     preferredChatAgent: normalizeNonEmptyString(config.get<unknown>('runPhase.preferredChatAgent')),
+    starterPrompt: normalizeNonEmptyString(config.get<unknown>('runPhase.starterPrompt')),
   };
 }
 
@@ -1058,6 +1222,11 @@ function parsePhaseRunProfileOverride(rawOverride: unknown): PhaseRunProfileOver
   const preferredChatAgent = normalizeNonEmptyString(rawOverride.preferredChatAgent);
   if (preferredChatAgent) {
     override.preferredChatAgent = preferredChatAgent;
+  }
+
+  const starterPrompt = normalizeNonEmptyString(rawOverride.starterPrompt);
+  if (starterPrompt) {
+    override.starterPrompt = starterPrompt;
   }
 
   return Object.keys(override).length > 0 ? override : undefined;
@@ -1211,7 +1380,7 @@ async function promptForPhaseRunProfile(
       {
         label: 'Set custom agent tag',
         description: existingOverride?.agentTag ?? defaults.agentTag ?? '#dev-orchestrator',
-        detail: 'Use a different prompt hint for this phase, for example #dev-orchestrator or @apex.',
+        detail: 'Use a different prompt hint for this phase, for example #dev-orchestrator or #review-pass.',
         mode: 'custom',
         picked: existingOverride?.agentTag !== undefined,
       },
@@ -1363,6 +1532,9 @@ async function promptForPhaseRunProfile(
   if (modelFamily !== undefined) {
     nextOverride.modelFamily = modelFamily;
   }
+  if (existingOverride?.starterPrompt !== undefined) {
+    nextOverride.starterPrompt = existingOverride.starterPrompt;
+  }
 
   const confirmation = await vscode.window.showInformationMessage(
     buildPhaseProfileConfirmation(target, defaults, nextOverride),
@@ -1416,7 +1588,9 @@ function normalizeNonEmptyString(value: unknown): string | undefined {
 
 function getConfiguredWorkflowDefinitions(output?: vscode.OutputChannel): readonly WorkflowDefinition[] {
   const rawDefinitions = vscode.workspace.getConfiguration('apexDelivery').get<unknown>('workflowDefinitions', {});
-  const parsed = parseWorkflowDefinitions(rawDefinitions);
+  const parsed = parseWorkflowDefinitions(rawDefinitions, {
+    workspaceRoot: vscode.workspace.workspaceFolders?.[0]?.uri.fsPath,
+  });
   for (const error of parsed.errors) {
     output?.appendLine(`[Workflow] ${error}`);
   }
@@ -1487,9 +1661,9 @@ async function runGuidedAutopilot(
   epicsPath: string,
   owner: string,
 ): Promise<GuidedAutopilotResult> {
-  const initialPolicy = resolveGuidedAutopilotPolicy(phase);
+  const initialPolicy = resolveGuidedAutopilotPolicy(phase, epic.workflowId);
   if (!initialPolicy.enabled) {
-    const reason = `${phase.name} is not marked as autopilot-enabled in the workflow snapshot.`;
+    const reason = `${phase.name} is not marked as autopilot-enabled for this epic workflow.`;
     output.appendLine(`[Autopilot] ${reason}`);
     if (!options.nonInteractive) {
       void vscode.window.showInformationMessage(reason);
@@ -1511,7 +1685,7 @@ async function runGuidedAutopilot(
     : 0;
 
   while (currentPhase) {
-    const policy = resolveGuidedAutopilotPolicy(currentPhase);
+    const policy = resolveGuidedAutopilotPolicy(currentPhase, currentEpic.workflowId);
     if (!policy.enabled) {
       await clearGuidedAutopilotState(context.workspaceState, currentEpic.key);
       return {
@@ -1531,6 +1705,7 @@ async function runGuidedAutopilot(
         epicKey: currentEpic.key,
         workflowId: currentEpic.workflowId,
         phaseId: currentPhase.id,
+        sessionId: resolveAutopilotSessionId(context.workspaceState, currentEpic.key, lastPhaseRun),
         attempts,
         status: 'paused',
         updatedAt: new Date().toISOString(),
@@ -1554,6 +1729,7 @@ async function runGuidedAutopilot(
       epicKey: currentEpic.key,
       workflowId: currentEpic.workflowId,
       phaseId: currentPhase.id,
+      sessionId: resolveAutopilotSessionId(context.workspaceState, currentEpic.key, lastPhaseRun),
       attempts,
       status: 'running',
       updatedAt: new Date().toISOString(),
@@ -1574,6 +1750,7 @@ async function runGuidedAutopilot(
         epicKey: currentEpic.key,
         workflowId: currentEpic.workflowId,
         phaseId: currentPhase.id,
+        sessionId: resolveAutopilotSessionId(context.workspaceState, currentEpic.key),
         attempts,
         status: 'paused',
         updatedAt: new Date().toISOString(),
@@ -1597,6 +1774,7 @@ async function runGuidedAutopilot(
         epicKey: currentEpic.key,
         workflowId: currentEpic.workflowId,
         phaseId: currentPhase.id,
+        sessionId: resolveAutopilotSessionId(context.workspaceState, currentEpic.key, phaseRun),
         attempts,
         status: 'paused',
         updatedAt: new Date().toISOString(),
@@ -1624,6 +1802,7 @@ async function runGuidedAutopilot(
         epicKey: currentEpic.key,
         workflowId: currentEpic.workflowId,
         phaseId: currentPhase.id,
+        sessionId: resolveAutopilotSessionId(context.workspaceState, currentEpic.key, phaseRun),
         attempts,
         status: 'paused',
         updatedAt: new Date().toISOString(),
@@ -1654,6 +1833,7 @@ async function runGuidedAutopilot(
         epicKey: currentEpic.key,
         workflowId: currentEpic.workflowId,
         phaseId: currentPhase.id,
+        sessionId: resolveAutopilotSessionId(context.workspaceState, currentEpic.key, phaseRun),
         attempts,
         status: 'paused',
         updatedAt: new Date().toISOString(),
@@ -1702,7 +1882,7 @@ async function runGuidedAutopilot(
       };
     }
 
-    if (!resolveGuidedAutopilotPolicy(rescannedNextPhase).enabled) {
+    if (!resolveGuidedAutopilotPolicy(rescannedNextPhase, rescannedEpic.workflowId).enabled) {
       await clearGuidedAutopilotState(context.workspaceState, currentEpic.key);
       if (!options.nonInteractive) {
         void vscode.window.showInformationMessage(`Guided Autopilot advanced ${currentEpic.key} to ${rescannedNextPhase.name} and paused for manual continuation.`);
@@ -1733,12 +1913,36 @@ async function runGuidedAutopilot(
   };
 }
 
-function resolveGuidedAutopilotPolicy(phase: PhaseStatus): Required<NonNullable<PhaseStatus['autopilot']>> {
+function resolveAutopilotSessionId(
+  store: vscode.Memento,
+  epicKey: string,
+  phaseRun?: PhaseCommandResult,
+): string | undefined {
+  return phaseRun?.sessionId ?? readGuidedAutopilotState(store, epicKey)?.sessionId;
+}
+
+function resolveWorkflowPhaseAutopilotPolicy(
+  workflowId: string | undefined,
+  phaseId: PhaseStatus['id'],
+): NonNullable<PhaseStatus['autopilot']> | undefined {
+  const workflow = resolveWorkflowDefinition(workflowId);
+  return workflow.phases.find((candidate) => candidate.id === phaseId)?.autopilot;
+}
+
+function resolveGuidedAutopilotPolicy(
+  phase: PhaseStatus,
+  workflowId?: string,
+): Required<NonNullable<PhaseStatus['autopilot']>> {
   const config = vscode.workspace.getConfiguration('apexDelivery');
+  const workflowPolicy = resolveWorkflowPhaseAutopilotPolicy(workflowId, phase.id);
   return {
-    enabled: phase.autopilot?.enabled === true,
-    retryLimit: phase.autopilot?.retryLimit ?? Math.max(0, config.get<number>('autopilot.defaultRetryLimit', 1)),
-    pauseOnManualIntervention: phase.autopilot?.pauseOnManualIntervention ?? config.get<boolean>('autopilot.pauseOnManualIntervention', true),
+    enabled: phase.autopilot?.enabled ?? workflowPolicy?.enabled ?? false,
+    retryLimit: phase.autopilot?.retryLimit
+      ?? workflowPolicy?.retryLimit
+      ?? Math.max(0, config.get<number>('autopilot.defaultRetryLimit', 1)),
+    pauseOnManualIntervention: phase.autopilot?.pauseOnManualIntervention
+      ?? workflowPolicy?.pauseOnManualIntervention
+      ?? config.get<boolean>('autopilot.pauseOnManualIntervention', true),
   };
 }
 
@@ -1782,7 +1986,7 @@ function advancePhaseState(
     phase.id,
     'passed',
     owner,
-    `${phase.name} passed through ${phase.gate}.`,
+    `${phase.name} passed.`,
   );
 
   const nextPhase = nextPhaseFor(epic, phase);
@@ -1820,6 +2024,7 @@ export function defaultPhaseCount(): number {
 function ensurePhaseArtifactExists(
   phase: PhaseStatus,
   epic: EpicStatus,
+  workspaceRoot: string,
   templateRoot: string,
   owner: string,
   output: vscode.OutputChannel,
@@ -1830,7 +2035,7 @@ function ensurePhaseArtifactExists(
   }
 
   const templateContext = buildTemplateContext(epic, owner);
-  writeFromTemplate(templateRoot, phase.artifact, phase.artifactPath, templateContext);
+  writeFromTemplate(workspaceRoot, templateRoot, resolvePhaseTemplateRef(phase), phase.artifactPath, templateContext);
   output.appendLine(`[Copilot] Seeded artifact: ${phase.artifactPath}`);
   refreshPipeline();
 }
@@ -1840,7 +2045,12 @@ function buildPhaseSessionContext(
   epic: EpicStatus,
   workspaceRoot: string,
 ): PhaseSessionContext {
+  const sessionKey = buildPhaseChatSessionKey(epic);
   return {
+    sessionId: sessionKey,
+    sessionKey,
+    transportId: 'not-configured',
+    transportStability: 'not-configured',
     phase,
     epic,
     workspaceRoot,
@@ -1850,6 +2060,110 @@ function buildPhaseSessionContext(
       readContextFile('Phase status', phase.statusPath, CONTEXT_LIMITS.status),
     ],
   };
+}
+
+async function resolvePhaseSessionContext(
+  provider: ApexSessionProvider,
+  phase: PhaseStatus,
+  epic: EpicStatus,
+  workspaceRoot: string,
+): Promise<PhaseSessionContext> {
+  const session = buildPhaseSessionContext(phase, epic, workspaceRoot);
+  const record = await provider.getOrCreate(epic, phase);
+  return bindSessionRecordToContext(session, record);
+}
+
+function bindSessionRecordToContext(
+  session: PhaseSessionContext,
+  record: ApexSessionRecord,
+): PhaseSessionContext {
+  return {
+    ...session,
+    sessionId: record.sessionId,
+    sessionKey: record.sessionKey,
+    transportId: record.transportId,
+    transportStability: record.transportStability,
+  };
+}
+
+function sessionToSessionRecord(session: PhaseSessionContext): ApexSessionRecord {
+  const now = new Date().toISOString();
+  return {
+    sessionId: session.sessionId,
+    sessionKey: session.sessionKey,
+    epicKey: session.epic.key,
+    workflowId: session.epic.workflowId,
+    currentPhaseId: session.phase.id,
+    currentPhaseName: session.phase.name,
+    transportId: session.transportId,
+    transportStability: session.transportStability,
+    status: 'prepared',
+    createdAt: now,
+    updatedAt: now,
+  };
+}
+
+async function bindPhaseSessionTransport(
+  provider: ApexSessionProvider,
+  session: PhaseSessionContext,
+  transport: { id: string; stability: ApexTransportStability; supportsExactSessionTargeting: boolean },
+  options?: {
+    resource?: string;
+    launchMode?: ApexSessionRecord['lastLaunchMode'];
+    fallbackReason?: string;
+  },
+): Promise<PhaseSessionContext> {
+  const record = await provider.bindTransport(session.sessionId, transport, options);
+  return record ? bindSessionRecordToContext(session, record) : {
+    ...session,
+    transportId: transport.id,
+    transportStability: transport.stability,
+  };
+}
+
+async function markPhaseSessionStatus(
+  provider: ApexSessionProvider,
+  session: PhaseSessionContext,
+  status: ApexSessionRecord['status'],
+  reason?: string,
+): Promise<PhaseSessionContext> {
+  const record = await provider.markStatus(session.sessionId, status, reason);
+  return record ? bindSessionRecordToContext(session, record) : session;
+}
+
+function buildPhaseSessionResultMetadata(session: PhaseSessionContext): Pick<PhaseCommandResult, 'sessionId' | 'transportId' | 'transportStability'> {
+  return {
+    sessionId: session.sessionId,
+    transportId: session.transportId,
+    transportStability: session.transportStability,
+  };
+}
+
+function buildPhaseChatSessionKey(epic: EpicStatus): string {
+  const digest = createHash('sha1')
+    .update(path.normalize(epic.folderPath).toLowerCase())
+    .update('\n')
+    .update(epic.key)
+    .digest('hex')
+    .slice(0, 12);
+  return `${epic.key}-${digest}`;
+}
+
+function buildPhaseChatSessionMarker(session: PhaseSessionContext): string {
+  return `APEX_SESSION=${session.sessionKey}`;
+}
+
+function buildPhaseChatSessionUri(session: Pick<PhaseSessionContext, 'sessionId'>): vscode.Uri {
+  const encodedSessionId = Buffer.from(session.sessionId, 'utf8').toString('base64url');
+  return vscode.Uri.from({
+    scheme: PHASE_CHAT_SESSION_URI_SCHEME,
+    authority: 'local',
+    path: `/${encodedSessionId}`,
+  });
+}
+
+function extractPhaseChatSessionKey(prompt: string): string | undefined {
+  return prompt.match(PHASE_CHAT_SESSION_PATTERN)?.[1];
 }
 
 function readContextFile(label: string, filePath: string, maxChars: number): PhaseContextFile {
@@ -1902,6 +2216,10 @@ function buildPhaseRunTraceEntry(
     startedAt: new Date().toISOString(),
     epicKey: session.epic.key,
     epicTitle: session.epic.title,
+    sessionId: session.sessionId,
+    sessionKey: session.sessionKey,
+    transportId: session.transportId,
+    transportStability: session.transportStability,
     workflowId: session.epic.workflowId,
     workflowName: session.epic.workflowName,
     phaseId: session.phase.id,
@@ -2298,6 +2616,7 @@ async function runPhaseWithCopilotModel(
   session: PhaseSessionContext,
   output: vscode.OutputChannel,
   options: PhaseCommandOptions,
+  runPreferences: PhaseRunPreferences,
   preferredModelFamily?: string,
 ): Promise<DirectPhaseRunResult> {
   const models = await vscode.lm.selectChatModels({ vendor: 'copilot' });
@@ -2317,6 +2636,9 @@ async function runPhaseWithCopilotModel(
   }
 
   output.show(true);
+  if (preferredModelFamily) {
+    output.appendLine(`[Copilot] Preferred direct model family for ${session.phase.id}: ${preferredModelFamily}.`);
+  }
   output.appendLine(`[Copilot] Direct run starting for ${session.epic.key} / ${session.phase.id} with ${formatModelLabel(model)}.`);
   output.appendLine('[Copilot] Streaming response:');
 
@@ -2324,7 +2646,7 @@ async function runPhaseWithCopilotModel(
   try {
     const runRequest = async (token: vscode.CancellationToken): Promise<void> => {
       const response = await model.sendRequest(
-        [vscode.LanguageModelChatMessage.User(buildDirectModelPrompt(session))],
+        [vscode.LanguageModelChatMessage.User(buildDirectModelPrompt(session, runPreferences))],
         {},
         token,
       );
@@ -2531,14 +2853,26 @@ function pickPreferredModel(
   return firstModel;
 }
 
+function buildDraftPhaseRunPreferences(runPreferences: PhaseRunPreferences): PhaseRunPreferences {
+  return {
+    ...runPreferences,
+    autoSubmit: false,
+  };
+}
+
 async function handoffPhaseToCopilotChat(
   session: PhaseSessionContext,
   output: vscode.OutputChannel,
+  chatTransport: ApexChatSessionTransport,
   options: PhaseCommandOptions,
   runPreferences?: PhaseRunPreferences,
 ): Promise<PhaseCommandResult> {
-  const chatStarter = buildApexChatStarter(session);
-  const chatLaunchResult = await tryStartCopilotChat(chatStarter, runPreferences?.autoSubmit ?? false);
+  const chatStarter = buildScopedChatStarter(session, runPreferences);
+  const chatLaunchResult = await chatTransport.openAsk(sessionToSessionRecord(session), {
+    prompt: chatStarter,
+    autoSubmit: runPreferences?.autoSubmit ?? false,
+    attachFiles: buildPhaseChatAttachments(session),
+  });
   if (chatLaunchResult !== 'prefilled' && chatLaunchResult !== 'submitted') {
     await vscode.env.clipboard.writeText(chatStarter);
   }
@@ -2547,11 +2881,12 @@ async function handoffPhaseToCopilotChat(
     return {
       mode: 'chat-fallback',
       artifactPath: session.phase.artifactPath,
+      ...buildPhaseSessionResultMetadata(session),
       fallbackReason: chatLaunchResult === 'prefilled'
-        ? 'Direct model execution was unavailable; opened GitHub Copilot Chat with an @apex prompt prefilled via public command integration.'
+        ? 'Direct model execution was unavailable; opened GitHub Copilot Chat with a scoped phase prompt prefilled via public command integration.'
         : chatLaunchResult === 'submitted'
-          ? 'Direct model execution was unavailable; submitted an @apex prompt to GitHub Copilot Chat via public command integration.'
-        : 'Direct model execution was unavailable; prepared an @apex chat starter as a manual fallback.',
+          ? 'Direct model execution was unavailable; submitted a scoped phase prompt to GitHub Copilot Chat via public command integration.'
+        : 'Direct model execution was unavailable; prepared a scoped phase prompt as a manual fallback.',
       chatStarter,
       chatLaunchResult,
         verification: [],
@@ -2560,7 +2895,7 @@ async function handoffPhaseToCopilotChat(
 
   const document = await vscode.workspace.openTextDocument({
     language: 'markdown',
-    content: buildPhaseSessionBrief(session.phase, session.epic, session.workspaceRoot),
+    content: buildPhaseSessionBrief(session.phase, session.epic, session.workspaceRoot, runPreferences),
   });
 
   await vscode.window.showTextDocument(document, {
@@ -2570,7 +2905,7 @@ async function handoffPhaseToCopilotChat(
 
   output.appendLine(
     chatLaunchResult === 'submitted'
-      ? `[Copilot] Submitted ${session.epic.key} / ${session.phase.id} to GitHub Copilot Chat using the @apex fallback prompt.`
+      ? `[Copilot] Submitted ${session.epic.key} / ${session.phase.id} to GitHub Copilot Chat using the scoped fallback prompt.`
       : chatLaunchResult === 'prefilled'
       ? `[Copilot] Opened GitHub Copilot Chat with ${session.epic.key} / ${session.phase.id} prefilled via public command integration.`
       : `[Copilot] Prepared ${session.epic.key} / ${session.phase.id} for GitHub Copilot Chat follow-up.`,
@@ -2578,12 +2913,12 @@ async function handoffPhaseToCopilotChat(
 
   const choice = await vscode.window.showInformationMessage(
     chatLaunchResult === 'submitted'
-      ? `GitHub Copilot Chat submitted the @apex fallback prompt for ${session.epic.key} / ${session.phase.name}.`
+      ? `GitHub Copilot Chat submitted the scoped fallback prompt for ${session.epic.key} / ${session.phase.name}.`
       : chatLaunchResult === 'prefilled'
-      ? `GitHub Copilot Chat is open with @apex prefilled for ${session.epic.key} / ${session.phase.name}. Review or adjust it before sending.`
+      ? `GitHub Copilot Chat is open with a scoped prompt prefilled for ${session.epic.key} / ${session.phase.name}. Review or adjust it before sending.`
       : chatLaunchResult === 'opened'
-        ? `GitHub Copilot Chat is open for ${session.epic.key} / ${session.phase.name}. Paste the copied @apex starter to continue.`
-        : `Phase chat follow-up ready for ${session.epic.key} / ${session.phase.name}. Open GitHub Copilot Chat and paste the copied @apex starter.`,
+        ? `GitHub Copilot Chat is open for ${session.epic.key} / ${session.phase.name}. Paste the copied scoped prompt to continue.`
+        : `Phase chat follow-up ready for ${session.epic.key} / ${session.phase.name}. Open GitHub Copilot Chat and paste the copied scoped prompt.`,
     'Open Artifact',
   );
 
@@ -2595,9 +2930,9 @@ async function handoffPhaseToCopilotChat(
     mode: 'chat-fallback',
     artifactPath: session.phase.artifactPath,
     fallbackReason: chatLaunchResult === 'prefilled'
-      ? 'Direct model execution was unavailable; opened GitHub Copilot Chat with an @apex prompt prefilled via public command integration.'
+      ? 'Direct model execution was unavailable; opened GitHub Copilot Chat with a scoped phase prompt prefilled via public command integration.'
       : chatLaunchResult === 'submitted'
-        ? 'Direct model execution was unavailable; submitted an @apex prompt to GitHub Copilot Chat via public command integration.'
+        ? 'Direct model execution was unavailable; submitted a scoped phase prompt to GitHub Copilot Chat via public command integration.'
       : 'Direct model execution was unavailable; handed off to GitHub Copilot Chat.',
     chatStarter,
     chatLaunchResult,
@@ -2607,6 +2942,7 @@ async function handoffPhaseToCopilotChat(
 async function launchPhaseInCopilotAgent(
   session: PhaseSessionContext,
   output: vscode.OutputChannel,
+  chatTransport: ApexChatSessionTransport,
   runPreferences: PhaseRunPreferences,
   nonInteractive: boolean,
 ): Promise<CopilotChatLaunchResult> {
@@ -2614,7 +2950,11 @@ async function launchPhaseInCopilotAgent(
 
   const chatStarter = buildCopilotAgentStarter(session, runPreferences);
   const attachFiles = buildPhaseChatAttachments(session);
-  const chatLaunchResult = await tryStartCopilotAgentChat(chatStarter, attachFiles, runPreferences.autoSubmit);
+  const chatLaunchResult = await chatTransport.openAgent(sessionToSessionRecord(session), {
+    prompt: chatStarter,
+    attachFiles,
+    autoSubmit: runPreferences.autoSubmit,
+  });
 
   if (chatLaunchResult !== 'prefilled' && chatLaunchResult !== 'submitted') {
     await vscode.env.clipboard.writeText(chatStarter);
@@ -2647,27 +2987,65 @@ async function launchPhaseInCopilotAgent(
   return chatLaunchResult;
 }
 
-async function continuePhaseInChat(session: PhaseSessionContext): Promise<void> {
-  const chatStarter = buildApexChatStarter(session);
-  const chatLaunchResult = await tryStartCopilotChat(chatStarter, false);
+async function continuePhaseInChat(
+  session: PhaseSessionContext,
+  chatTransport: ApexChatSessionTransport,
+  runPreferences?: PhaseRunPreferences,
+): Promise<void> {
+  const chatStarter = buildScopedChatStarter(
+    session,
+    runPreferences ? buildDraftPhaseRunPreferences(runPreferences) : undefined,
+  );
+  const chatLaunchResult = await chatTransport.openAsk(sessionToSessionRecord(session), {
+    prompt: chatStarter,
+    autoSubmit: false,
+    attachFiles: buildPhaseChatAttachments(session),
+  });
   if (chatLaunchResult !== 'prefilled' && chatLaunchResult !== 'submitted') {
     await vscode.env.clipboard.writeText(chatStarter);
   }
 
   void vscode.window.showInformationMessage(
     chatLaunchResult === 'prefilled'
-      ? `GitHub Copilot Chat is open with @apex prefilled for ${session.epic.key} / ${session.phase.name}. Review or adjust it before sending.`
+      ? `GitHub Copilot Chat is open with a scoped prompt prefilled for ${session.epic.key} / ${session.phase.name}. Review or adjust it before sending.`
       : chatLaunchResult === 'opened'
-        ? `GitHub Copilot Chat is ready. Paste the copied @apex starter to continue ${session.epic.key} / ${session.phase.name}.`
-        : `Open GitHub Copilot Chat and paste the copied @apex starter to continue ${session.epic.key} / ${session.phase.name}.`,
+        ? `GitHub Copilot Chat is ready. Paste the copied scoped prompt to continue ${session.epic.key} / ${session.phase.name}.`
+        : `Open GitHub Copilot Chat and paste the copied scoped prompt to continue ${session.epic.key} / ${session.phase.name}.`,
   );
 }
 
+  async function tryOpenPhaseChatSession(session: Pick<PhaseSessionContext, 'sessionId'>): Promise<boolean> {
+    const sessionUri = buildPhaseChatSessionUri(session);
+    const commands = [
+      'workbench.action.chat.openSessionInNewEditorGroup',
+      'workbench.action.chat.openSessionInEditorGroup',
+    ];
+
+    for (const command of commands) {
+      try {
+        await vscode.commands.executeCommand(command, { resource: sessionUri });
+        return true;
+      } catch {
+        // Try the next session-open entrypoint.
+      }
+    }
+
+    try {
+      await vscode.commands.executeCommand('vscode.open', sessionUri);
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
 async function tryStartCopilotAgentChat(
+  session: Pick<PhaseSessionContext, 'sessionId'>,
   query: string,
   attachFiles: readonly vscode.Uri[],
   autoSubmit: boolean,
 ): Promise<CopilotChatLaunchResult> {
+    const openedScopedSession = await tryOpenPhaseChatSession(session);
+
   try {
     await vscode.commands.executeCommand('workbench.action.chat.open', {
       mode: 'agent',
@@ -2677,6 +3055,10 @@ async function tryStartCopilotAgentChat(
     });
     return autoSubmit ? 'submitted' : 'prefilled';
   } catch {
+    if (openedScopedSession) {
+      return 'opened';
+    }
+
     // Fall through to opening the agent UI without prefilling.
   }
 
@@ -2700,18 +3082,32 @@ async function tryStartCopilotAgentChat(
   return 'unavailable';
 }
 
-async function tryStartCopilotChat(query?: string, autoSubmit = false): Promise<CopilotChatLaunchResult> {
+async function tryStartCopilotChat(
+  session: Pick<PhaseSessionContext, 'sessionId'>,
+  query?: string,
+  autoSubmit = false,
+  attachFiles: readonly vscode.Uri[] = [],
+): Promise<CopilotChatLaunchResult> {
+  const openedScopedSession = await tryOpenPhaseChatSession(session);
+
   if (query) {
     try {
       await vscode.commands.executeCommand('workbench.action.chat.open', {
         mode: 'ask',
         query,
         ...(autoSubmit ? {} : { isPartialQuery: true }),
+        ...(attachFiles.length > 0 ? { attachFiles } : {}),
       });
       return autoSubmit ? 'submitted' : 'prefilled';
     } catch {
+      if (openedScopedSession) {
+        return 'opened';
+      }
+
       // Fall through to opening chat without prefilling.
     }
+  } else if (openedScopedSession) {
+    return 'opened';
   }
 
   const commands = [
@@ -2736,6 +3132,7 @@ function buildPhaseSessionBrief(
   phase: PhaseStatus,
   epic: EpicStatus,
   workspaceRoot: string,
+  runPreferences?: PhaseRunPreferences,
 ): string {
   const epicPath = displayPath(workspaceRoot, path.join(epic.folderPath, 'EPIC.md'));
   const artifactPath = displayPath(workspaceRoot, phase.artifactPath);
@@ -2752,7 +3149,6 @@ function buildPhaseSessionBrief(
     `- Epic: ${epic.key} - ${epic.title}`,
     `- Status: ${phase.status}`,
     `- Owner: ${phase.owner}`,
-    `- Gate: ${phase.gate}`,
     `- Expected output: ${phase.output}`,
     '',
     '## Relevant Files',
@@ -2765,33 +3161,46 @@ function buildPhaseSessionBrief(
     lines.push('', '## Existing Notes', phase.notes);
   }
 
-  lines.push('', '## Prompt To Paste Into Copilot Chat', buildApexChatStarter(buildPhaseSessionContext(phase, epic, workspaceRoot)));
+  lines.push('', '## Prompt To Paste Into Copilot Chat', buildScopedChatStarter(buildPhaseSessionContext(phase, epic, workspaceRoot), runPreferences));
   return lines.join('\n');
 }
 
-function buildApexChatStarter(session: PhaseSessionContext): string {
-  return buildParticipantChatStarter(session, 'apex');
-}
-
-function buildParticipantChatStarter(session: PhaseSessionContext, participant: string): string {
+function buildScopedChatStarter(session: PhaseSessionContext, runPreferences?: PhaseRunPreferences): string {
+  const epicPath = displayPath(session.workspaceRoot, path.join(session.epic.folderPath, 'EPIC.md'));
+  const artifactPath = displayPath(session.workspaceRoot, session.phase.artifactPath);
+  const statusPath = displayPath(session.workspaceRoot, session.phase.statusPath);
   return [
-    `@${participant.replace(/^@+/, '')}`,
+    buildPhaseChatSessionMarker(session),
+    runPreferences?.preferredChatAgent ? `Preferred GitHub Copilot Chat agent: ${runPreferences.preferredChatAgent}.` : undefined,
+    runPreferences?.agentTag ? `Continue with ${runPreferences.agentTag}.` : undefined,
+    runPreferences?.modelFamily ? `Preferred model family hint: ${runPreferences.modelFamily}. GitHub Copilot Chat still follows the active chat UI model selector.` : undefined,
     `Continue the ${session.phase.name} phase for ${session.epic.key} (${session.epic.title}).`,
-    `Keep the answer scoped to ${path.basename(session.phase.artifactPath)} and the current phase gate.`,
+    `Treat this as a dedicated conversation for ${session.epic.key} only. Ignore prior turns that refer to a different epic or a different APEX_SESSION marker.`,
+    `Keep the answer scoped to ${path.basename(session.phase.artifactPath)} and the current phase only.`,
+    `Use these files as the source of truth when they are attached or open: ${epicPath}, ${artifactPath}, ${statusPath}.`,
     `When possible, update the existing artifact instead of drafting a separate scratch document.`,
     'If source information is missing, list explicit open questions instead of inventing facts.',
-  ].join(' ');
+    runPreferences?.starterPrompt ? '' : undefined,
+    runPreferences?.starterPrompt ? 'Workflow-specific starter prompt:' : undefined,
+    runPreferences?.starterPrompt,
+  ].filter((line): line is string => typeof line === 'string').join('\n');
 }
 
 function buildCopilotAgentStarter(session: PhaseSessionContext, runPreferences: PhaseRunPreferences): string {
   return [
+    buildPhaseChatSessionMarker(session),
     runPreferences.preferredChatAgent ? `Preferred GitHub Copilot Chat agent: ${runPreferences.preferredChatAgent}.` : undefined,
     runPreferences.agentTag ? `Continue with ${runPreferences.agentTag}.` : undefined,
+    runPreferences.modelFamily ? `Preferred model family hint: ${runPreferences.modelFamily}. GitHub Copilot Chat still uses the active chat UI selection because the public chat-open API does not expose model locking.` : undefined,
     `Update the attached phase artifact ${path.basename(session.phase.artifactPath)} for ${session.epic.key} (${session.epic.title}).`,
-    `Keep the work scoped to the ${session.phase.name} phase and its gate: ${session.phase.gate}.`,
+    `Keep the work scoped to the ${session.phase.name} phase only.`,
+    `Treat this as a dedicated conversation for ${session.epic.key} only. Ignore prior turns that refer to a different epic or a different APEX_SESSION marker.`,
     `Edit the existing artifact in place instead of creating a new untitled or side document.`,
     `Use the attached epic brief and phase status as context, and leave explicit open questions where source information is missing.`,
-  ].filter((line): line is string => typeof line === 'string').join(' ');
+    runPreferences.starterPrompt ? '' : undefined,
+    runPreferences.starterPrompt ? 'Workflow-specific starter prompt:' : undefined,
+    runPreferences.starterPrompt,
+  ].filter((line): line is string => typeof line === 'string').join('\n');
 }
 
 function buildPhaseChatAttachments(session: PhaseSessionContext): readonly vscode.Uri[] {
@@ -2806,7 +3215,7 @@ function buildPhaseChatAttachments(session: PhaseSessionContext): readonly vscod
     .map((candidatePath) => vscode.Uri.file(candidatePath));
 }
 
-function buildDirectModelPrompt(session: PhaseSessionContext): string {
+function buildDirectModelPrompt(session: PhaseSessionContext, runPreferences?: PhaseRunPreferences): string {
   const artifactPath = displayPath(session.workspaceRoot, session.phase.artifactPath);
   const lines = [
     'You are assisting one APEX delivery phase inside VS Code.',
@@ -2821,15 +3230,17 @@ function buildDirectModelPrompt(session: PhaseSessionContext): string {
     `Epic: ${session.epic.key} - ${session.epic.title}`,
     `Phase: ${session.phase.name} (${session.phase.id})`,
     `Status: ${session.phase.status}`,
-    `Gate: ${session.phase.gate}`,
     `Expected output: ${session.phase.output}`,
     `Primary artifact: ${artifactPath}`,
+    runPreferences?.starterPrompt ? '' : undefined,
+    runPreferences?.starterPrompt ? 'Workflow-specific starter prompt:' : undefined,
+    runPreferences?.starterPrompt,
     '',
     'Source text:',
     formatSessionReferences(session),
   ];
 
-  return lines.join('\n');
+  return lines.filter((line): line is string => typeof line === 'string').join('\n');
 }
 
 function buildArtifactProposalPrompt(session: PhaseSessionContext): string {
@@ -2844,7 +3255,6 @@ function buildArtifactProposalPrompt(session: PhaseSessionContext): string {
     '',
     `Epic: ${session.epic.key} - ${session.epic.title}`,
     `Phase: ${session.phase.name} (${session.phase.id})`,
-    `Gate: ${session.phase.gate}`,
     `Artifact path: ${artifactPath}`,
     '',
     'Source text:',
@@ -2857,12 +3267,12 @@ function buildArtifactProposalPrompt(session: PhaseSessionContext): string {
 function buildParticipantPrompt(session: PhaseSessionContext, followUpPrompt: string): string {
   return [
     'Continue an existing APEX delivery phase conversation.',
+    buildPhaseChatSessionMarker(session),
     `User follow-up: ${followUpPrompt}`,
     'Keep the response scoped to the current phase and use the stored context below as the source of truth.',
     '',
     `Epic: ${session.epic.key} - ${session.epic.title}`,
     `Phase: ${session.phase.name} (${session.phase.id})`,
-    `Gate: ${session.phase.gate}`,
     '',
     'Stored source text:',
     formatSessionReferences(session),
@@ -2891,10 +3301,11 @@ function buildDirectModelResultDocument(
     '',
     `- Model: ${formatModelLabel(model)}`,
     `- Artifact: ${displayPath(session.workspaceRoot, session.phase.artifactPath)}`,
-    `- Gate: ${session.phase.gate}`,
+    `- Session Id: ${session.sessionId}`,
+    `- Session: ${session.sessionKey}`,
     '',
     '## Follow-up',
-    'Use `@apex` in GitHub Copilot Chat if you want to continue from this exact phase context.',
+    'Use Continue in Chat or rerun Run Phase with Copilot if you want a refreshed scoped prompt for this exact phase context.',
     '',
     '## Response',
     responseText.trim().length > 0 ? responseText.trim() : '_No response text returned._',

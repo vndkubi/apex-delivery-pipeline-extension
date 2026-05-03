@@ -1,6 +1,7 @@
 import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
+import { pathToFileURL } from 'url';
 import { runTests } from '@vscode/test-electron';
 
 async function main(): Promise<void> {
@@ -12,7 +13,7 @@ async function main(): Promise<void> {
     await runTests({
       extensionDevelopmentPath,
       extensionTestsPath,
-      launchArgs: [workspacePath],
+      launchArgs: ['--folder-uri', pathToFileURL(workspacePath).toString()],
     });
   } catch (error: unknown) {
     const message = error instanceof Error ? error.stack ?? error.message : String(error);

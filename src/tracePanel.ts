@@ -15,6 +15,10 @@ export interface PhaseRunTraceEntry {
   startedAt: string;
   epicKey: string;
   epicTitle: string;
+  sessionId?: string;
+  sessionKey?: string;
+  transportId?: string;
+  transportStability?: string;
   workflowId?: string;
   workflowName?: string;
   phaseId: string;
@@ -254,7 +258,7 @@ function renderEntry(entry: PhaseRunTraceEntry): string {
         <div class="entry-meta">
           ${escapeHtml(entry.epicTitle)}<br>
           Workflow: ${escapeHtml(workflowLabel)}<br>
-          ${escapeHtml(formatDateTime(entry.startedAt))} · ${escapeHtml(entry.executionPath)} · ${escapeHtml(entry.artifactPath)}${entry.preferredAgent ? `<br>Preferred Agent: ${escapeHtml(entry.preferredAgent)}` : ''}${entry.userRole ? `<br>User Role: ${escapeHtml(entry.userRole)}` : ''}${entry.preferredRole ? `<br>Preferred Role: ${escapeHtml(entry.preferredRole)}` : ''}
+          ${escapeHtml(formatDateTime(entry.startedAt))} · ${escapeHtml(entry.executionPath)} · ${escapeHtml(entry.artifactPath)}${entry.sessionKey ? `<br>${escapeHtml(formatTraceSessionLabel(entry.sessionKey))}` : ''}${entry.sessionId ? `<br>Session Id: ${escapeHtml(entry.sessionId)}` : ''}${entry.transportId ? `<br>Transport: ${escapeHtml(formatTransportLabel(entry.transportId, entry.transportStability))}` : ''}${entry.preferredAgent ? `<br>Preferred Agent: ${escapeHtml(entry.preferredAgent)}` : ''}${entry.userRole ? `<br>User Role: ${escapeHtml(entry.userRole)}` : ''}${entry.preferredRole ? `<br>Preferred Role: ${escapeHtml(entry.preferredRole)}` : ''}
         </div>
       </div>
       <div class="badges">
@@ -275,6 +279,9 @@ function renderEntry(entry: PhaseRunTraceEntry): string {
         <h2>Decision</h2>
         <div class="entry-meta">Path: ${escapeHtml(entry.executionPath)}</div>
         <div class="entry-meta">Result: ${escapeHtml(entry.result)}</div>
+        <div class="entry-meta">Session: ${escapeHtml(formatTraceSessionLabel(entry.sessionKey))}</div>
+        ${entry.sessionId ? `<div class="entry-meta">Session Id: ${escapeHtml(entry.sessionId)}</div>` : ''}
+        ${entry.transportId ? `<div class="entry-meta">Transport: ${escapeHtml(formatTransportLabel(entry.transportId, entry.transportStability))}</div>` : ''}
         <div class="entry-meta">Agent check: ${escapeHtml(entry.agentSelectionStatus ?? 'not-configured')}</div>
         ${entry.activeAgent ? `<div class="entry-meta">Active agent: ${escapeHtml(entry.activeAgent)}</div>` : ''}
         ${entry.agentSelectionNote ? `<div class="entry-meta">${escapeHtml(entry.agentSelectionNote)}</div>` : ''}
@@ -313,4 +320,12 @@ function formatDuration(durationMs: number): string {
     return `${durationMs} ms`;
   }
   return `${(durationMs / 1000).toFixed(1)} s`;
+}
+
+function formatTraceSessionLabel(sessionKey?: string): string {
+  return sessionKey ? `APEX_SESSION=${sessionKey}` : 'APEX_SESSION unavailable';
+}
+
+function formatTransportLabel(transportId: string, transportStability?: string): string {
+  return transportStability ? `${transportId} (${transportStability})` : transportId;
 }

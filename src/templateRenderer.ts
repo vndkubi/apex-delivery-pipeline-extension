@@ -1,5 +1,6 @@
 import * as fs from 'fs';
 import * as path from 'path';
+import { resolveTemplateRefPath } from './templateRef';
 
 export interface TemplateContext {
   epicKey: string;
@@ -17,15 +18,16 @@ export function renderTemplate(content: string, context: TemplateContext): strin
 }
 
 export function writeFromTemplate(
+  workspaceRoot: string,
   templateRoot: string,
-  templateName: string,
+  templateRef: string,
   targetPath: string,
   context: TemplateContext,
 ): void {
-  const templatePath = path.join(templateRoot, templateName);
-  const raw = fs.existsSync(templatePath)
+  const templatePath = resolveTemplateRefPath(workspaceRoot, templateRoot, templateRef);
+  const raw = templatePath && fs.existsSync(templatePath)
     ? fs.readFileSync(templatePath, 'utf8')
-    : fallbackTemplate(templateName, context);
+    : fallbackTemplate(path.basename(templateRef), context);
 
   fs.mkdirSync(path.dirname(targetPath), { recursive: true });
   fs.writeFileSync(targetPath, renderTemplate(raw, context), 'utf8');

@@ -1,8 +1,8 @@
 {
   "name": "apex-delivery-pipeline-v1",
   "displayName": "APEX Delivery Pipeline for Copilot",
-  "description": "A Copilot-first VS Code extension for APEX delivery epics, direct model runs, @apex chat follow-ups, MCP setup, and ROI-ready workflow status.",
-  "version": "0.5.2",
+  "description": "A Copilot-first VS Code extension for file-based APEX delivery epics, scoped phase runs, workflow editing, MCP setup, and developer traceability.",
+  "version": "0.5.5",
   "publisher": "vndkubi",
   "license": "MIT",
   "repository": {
@@ -136,6 +136,10 @@
                       "type": "string",
                       "description": "Artifact filename created from the extension templates, for example DISCOVER.md or REVIEW.md."
                     },
+                    "templateRef": {
+                      "type": "string",
+                      "description": "Optional template source for this phase. Use a bundled generic template filename like DISCOVERY.md or a workspace-relative markdown path like docs/templates/custom/discovery.md."
+                    },
                     "gate": {
                       "type": "string",
                       "enum": [
@@ -148,6 +152,10 @@
                     "output": {
                       "type": "string",
                       "description": "Expected output label displayed for the phase."
+                    },
+                    "outputRef": {
+                      "type": "string",
+                      "description": "Optional workspace-relative file path used as the source for the phase output text. The extension keeps `output` as the cached fallback snapshot."
                     },
                     "autopilot": {
                       "type": "object",
@@ -165,6 +173,36 @@
                         "pauseOnManualIntervention": {
                           "type": "boolean",
                           "description": "When true, guided autopilot pauses if a human intervenes during the phase."
+                        }
+                      }
+                    },
+                    "sessionDefaults": {
+                      "type": "object",
+                      "description": "Optional workflow-scoped session defaults used when a new Run Phase session starts for this phase.",
+                      "properties": {
+                        "autoSubmit": {
+                          "type": "boolean",
+                          "description": "Default auto-submit behavior for this phase when opening GitHub Copilot Chat."
+                        },
+                        "agentTag": {
+                          "type": "string",
+                          "description": "Optional best-effort agent routing tag added to this phase prompt."
+                        },
+                        "preferredChatAgent": {
+                          "type": "string",
+                          "description": "Optional human-readable preferred GitHub Copilot Chat agent for this phase."
+                        },
+                        "modelFamily": {
+                          "type": "string",
+                          "description": "Preferred model family for extension-owned direct execution for this phase. Public Chat launches can only treat this as a hint."
+                        },
+                        "starterPrompt": {
+                          "type": "string",
+                          "description": "Optional workflow-specific starter prompt appended to the scoped phase instructions."
+                        },
+                        "starterPromptRef": {
+                          "type": "string",
+                          "description": "Optional workspace-relative file path used as the source for the workflow-specific starter prompt. The extension keeps `starterPrompt` as the cached fallback snapshot."
                         }
                       }
                     }
@@ -199,6 +237,11 @@
           "default": "gpt-4.1",
           "description": "Preferred model family for extension-driven direct execution or direct fallback. GitHub Copilot Chat model selection still follows the active chat UI."
         },
+        "apexDelivery.runPhase.starterPrompt": {
+          "type": "string",
+          "default": "",
+          "description": "Optional workspace-wide starter prompt appended to the scoped Run Phase instructions."
+        },
         "apexDelivery.runPhase.phaseProfiles": {
           "type": "object",
           "default": {},
@@ -223,6 +266,10 @@
                 "modelFamily": {
                   "type": "string",
                   "description": "Preferred model family for extension-driven direct execution or direct fallback for this phase."
+                },
+                "starterPrompt": {
+                  "type": "string",
+                  "description": "Optional workflow-scoped starter prompt appended to the scoped phase instructions for this phase."
                 }
               }
             }
@@ -250,6 +297,10 @@
               "modelFamily": {
                 "type": "string",
                 "description": "Default direct-execution model family for this role."
+              },
+              "starterPrompt": {
+                "type": "string",
+                "description": "Default starter prompt appended to scoped phase instructions for this role."
               }
             }
           }
@@ -336,6 +387,12 @@
         "command": "apexDelivery.configurePhaseProfile",
         "title": "Configure Phase Profile",
         "icon": "$(settings-gear)",
+        "category": "APEX Delivery"
+      },
+      {
+        "command": "apexDelivery.configureWorkflows",
+        "title": "Configure Workflows",
+        "icon": "$(edit-session)",
         "category": "APEX Delivery"
       },
       {
@@ -433,17 +490,7 @@
           "group": "navigation@4"
         },
         {
-          "command": "apexDelivery.startIntegratedFlow",
-          "when": "view == apexDeliveryView",
-          "group": "navigation@5"
-        },
-        {
-          "command": "apexDelivery.runGuidedAutopilot",
-          "when": "view == apexDeliveryView",
-          "group": "navigation@6"
-        },
-        {
-          "command": "apexDelivery.runFullyAutomaticAutopilot",
+          "command": "apexDelivery.configureWorkflows",
           "when": "view == apexDeliveryView",
           "group": "navigation@7"
         },
@@ -455,34 +502,9 @@
       ],
       "view/item/context": [
         {
-          "command": "apexDelivery.runGuidedAutopilot",
-          "when": "view == apexDeliveryView && viewItem == epic",
-          "group": "navigation@0"
-        },
-        {
-          "command": "apexDelivery.runFullyAutomaticAutopilot",
-          "when": "view == apexDeliveryView && viewItem == epic",
-          "group": "navigation@1"
-        },
-        {
-          "command": "apexDelivery.pauseGuidedAutopilot",
-          "when": "view == apexDeliveryView && viewItem == epic",
-          "group": "navigation@2"
-        },
-        {
-          "command": "apexDelivery.resumeGuidedAutopilot",
-          "when": "view == apexDeliveryView && viewItem == epic",
-          "group": "navigation@3"
-        },
-        {
           "command": "apexDelivery.runPhaseInCopilot",
           "when": "view == apexDeliveryView && viewItem =~ /^phase/",
           "group": "inline@0"
-        },
-        {
-          "command": "apexDelivery.runGuidedAutopilot",
-          "when": "view == apexDeliveryView && viewItem =~ /^phase/",
-          "group": "inline@1"
         },
         {
           "command": "apexDelivery.openOrCreateArtifact",
@@ -505,29 +527,9 @@
           "group": "inline@5"
         },
         {
-          "command": "apexDelivery.pauseGuidedAutopilot",
-          "when": "view == apexDeliveryView && viewItem =~ /^phase/",
-          "group": "inline@6"
-        },
-        {
-          "command": "apexDelivery.resumeGuidedAutopilot",
-          "when": "view == apexDeliveryView && viewItem =~ /^phase/",
-          "group": "inline@7"
-        },
-        {
           "command": "apexDelivery.runPhaseInCopilot",
           "when": "view == apexDeliveryView && viewItem =~ /^phase/",
           "group": "navigation@0"
-        },
-        {
-          "command": "apexDelivery.runGuidedAutopilot",
-          "when": "view == apexDeliveryView && viewItem =~ /^phase/",
-          "group": "navigation@1"
-        },
-        {
-          "command": "apexDelivery.runFullyAutomaticAutopilot",
-          "when": "view == apexDeliveryView && viewItem =~ /^phase/",
-          "group": "navigation@2"
         }
       ]
     }

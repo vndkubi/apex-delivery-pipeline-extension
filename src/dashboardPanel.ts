@@ -299,6 +299,6 @@ function renderEpic(epic: EpicStatus): string {
 function renderPhase(phase: PhaseStatus): string {
   return `<div class="phase ${escapeHtml(phase.status)}">
     <div class="phase-name">${escapeHtml(phase.name)}</div>
-    <div class="status">${escapeHtml(phase.status)} · ${escapeHtml(phase.gate)}<br>${escapeHtml(phase.owner)}</div>
+    <div class="status">${escapeHtml(phase.status)}<br>${escapeHtml(phase.owner)}</div>
   </div>`;
 }

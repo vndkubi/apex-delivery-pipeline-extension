@@ -40,7 +40,6 @@ export class PipelineProvider implements vscode.TreeDataProvider<TreeNode> {
     if (element instanceof PhaseItem) {
       return [
         new DetailItem('Owner', element.phase.owner, 'account'),
-        new DetailItem('Gate', element.phase.gate, 'shield'),
         new DetailItem('Output', element.phase.output, 'output'),
         new DetailItem('Artifact', element.phase.artifact, 'file', element.phase.artifactPath),
         new DetailItem('Status file', path.basename(element.phase.statusPath), 'json', element.phase.statusPath),
@@ -122,7 +121,6 @@ function buildPhaseTooltip(phase: PhaseStatus): string {
     '',
     `**Status**: ${phase.status}`,
     `**Owner**: ${phase.owner}`,
-    `**Quality Gate**: ${phase.gate}`,
     `**Artifact**: ${phase.artifact}`,
     `**Output**: ${phase.output}`,
   ];
