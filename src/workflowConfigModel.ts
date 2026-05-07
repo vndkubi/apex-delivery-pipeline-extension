@@ -72,7 +72,8 @@ export interface WorkflowEditorValidationIssue {
 
 const VALID_GATES: ReadonlySet<string> = new Set(['Gate 1', 'Gate 2', 'Gate 3']);
 const ARTIFACT_FILENAME_PATTERN = /^[^\\/]+\.md$/i;
-const VALID_EXECUTION_MODES: ReadonlySet<WorkflowExecutionMode> = new Set(['control', 'pooled', 'pinned']);
+const EDITOR_EXECUTION_MODES: readonly WorkflowExecutionMode[] = ['control', 'pinned'];
+const VALID_EXECUTION_MODES: ReadonlySet<WorkflowExecutionMode> = new Set(EDITOR_EXECUTION_MODES);
 
 export function listBundledTemplateRefs(templateRoot: string): readonly string[] {
   if (!fs.existsSync(templateRoot)) {
@@ -319,11 +320,11 @@ export function duplicateWorkflowDraft(workflow: WorkflowEditorWorkflowDraft, in
 function buildExecutionDraft(execution: WorkflowExecutionPolicy | undefined): WorkflowEditorExecutionDraft {
   return {
     configured: execution !== undefined,
-    mode: execution?.mode ?? 'control',
+    mode: sanitizeExecutionMode(execution?.mode),
     commands: {
-      runPhase: execution?.commands?.runPhase ?? 'control',
-      reviewPullRequest: execution?.commands?.reviewPullRequest ?? 'control',
-      openWorkspace: execution?.commands?.openWorkspace ?? 'pinned',
+      runPhase: sanitizeExecutionMode(execution?.commands?.runPhase),
+      reviewPullRequest: sanitizeExecutionMode(execution?.commands?.reviewPullRequest),
+      openWorkspace: sanitizeExecutionMode(execution?.commands?.openWorkspace, 'pinned'),
     },
   };
 }
@@ -346,16 +347,16 @@ function validateExecutionDraft(
 ): WorkflowEditorValidationIssue[] {
   const issues: WorkflowEditorValidationIssue[] = [];
   if (!VALID_EXECUTION_MODES.has(execution.mode)) {
-    issues.push(issue(`workflow.${workflowIndex}.execution.mode`, 'Default execution mode must be control, pooled, or pinned.'));
+    issues.push(issue(`workflow.${workflowIndex}.execution.mode`, 'Default execution mode must be control or pinned.'));
   }
   if (!VALID_EXECUTION_MODES.has(execution.commands.runPhase)) {
-    issues.push(issue(`workflow.${workflowIndex}.execution.commands.runPhase`, 'Run Phase execution must be control, pooled, or pinned.'));
+    issues.push(issue(`workflow.${workflowIndex}.execution.commands.runPhase`, 'Run Phase execution must be control or pinned.'));
   }
   if (!VALID_EXECUTION_MODES.has(execution.commands.reviewPullRequest)) {
-    issues.push(issue(`workflow.${workflowIndex}.execution.commands.reviewPullRequest`, 'Review Pull Request execution must be control, pooled, or pinned.'));
+    issues.push(issue(`workflow.${workflowIndex}.execution.commands.reviewPullRequest`, 'Review Pull Request execution must be control or pinned.'));
   }
   if (!VALID_EXECUTION_MODES.has(execution.commands.openWorkspace)) {
-    issues.push(issue(`workflow.${workflowIndex}.execution.commands.openWorkspace`, 'Open Workspace execution must be control, pooled, or pinned.'));
+    issues.push(issue(`workflow.${workflowIndex}.execution.commands.openWorkspace`, 'Open Workspace execution must be control or pinned.'));
   }
   return issues;
 }
@@ -538,6 +539,15 @@ function sanitizeAutopilot(autopilot: PhaseAutopilotPolicy | undefined): PhaseAu
 
 function issue(path: string, message: string): WorkflowEditorValidationIssue {
   return { path, message };
+}
+
+function sanitizeExecutionMode(
+  mode: WorkflowExecutionMode | undefined,
+  fallback: WorkflowExecutionMode = 'control',
+): WorkflowExecutionMode {
+  return mode === 'pinned' || mode === 'control'
+    ? mode
+    : fallback;
 }
 
 function workflowToDraft(workflow: WorkflowDefinition): WorkflowEditorWorkflowDraft {

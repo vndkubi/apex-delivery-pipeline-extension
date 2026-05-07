@@ -2,7 +2,7 @@
   "name": "apex-delivery-pipeline-v1",
   "displayName": "APEX Delivery Pipeline for Copilot",
   "description": "A Copilot-first VS Code extension for file-based APEX delivery epics, scoped phase runs, workflow editing, branch-linked worktrees, PR review artifacts, MCP setup, and developer traceability.",
-  "version": "0.5.8",
+  "version": "0.5.9",
   "publisher": "vndkubi",
   "license": "MIT",
   "repository": {
@@ -406,7 +406,7 @@
       },
       {
         "command": "apexDelivery.createSampleEpic",
-        "title": "Create Sample Epic",
+        "title": "Create Epic",
         "icon": "$(add)",
         "category": "APEX Delivery"
       },

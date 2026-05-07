@@ -531,7 +531,7 @@ export function activate(context: vscode.ExtensionContext): void {
     const workflow = options.nonInteractive
       ? resolveWorkflowDefinition(options.workflowId, output)
       : await pickWorkflowDefinition(output, {
-        title: 'Create sample epic',
+        title: 'Create epic',
         placeHolder: 'Choose the workflow snapshot stored in the new epic.',
       });
 
@@ -539,11 +539,25 @@ export function activate(context: vscode.ExtensionContext): void {
       return;
     }
 
-    const result = createSampleEpic(workspaceRoot, getEpicsPath(), templateRoot, getOwner(), workflow);
-    output.appendLine(`Created sample epic: ${result.epicKey} (${result.workflowName}/${result.workflowId})`);
+    const title = normalizeNonEmptyString(options.title)
+      ?? (options.nonInteractive
+        ? 'AI Delivery Pipeline Pilot'
+        : await vscode.window.showInputBox({
+          title: 'Create epic',
+          prompt: 'Enter the epic title.',
+          placeHolder: 'Investigate review evidence workflow for delivery leads',
+          ignoreFocusOut: true,
+          validateInput: (input) => input.trim().length === 0 ? 'Epic title is required.' : null,
+        }));
+    if (!title) {
+      return;
+    }
+
+    const result = createSampleEpic(workspaceRoot, getEpicsPath(), templateRoot, getOwner(), workflow, title);
+    output.appendLine(`Created epic: ${result.epicKey} (${result.workflowName}/${result.workflowId})`);
     refreshPipeline();
     await vscode.commands.executeCommand('vscode.open', vscode.Uri.file(path.join(result.folderPath, 'EPIC.md')));
-    void vscode.window.showInformationMessage(`Created sample epic ${result.epicKey} with workflow ${result.workflowName}.`);
+    void vscode.window.showInformationMessage(`Created epic ${result.epicKey} with workflow ${result.workflowName}.`);
   }));
   registerPbiCommands({
     context,
@@ -3730,7 +3744,7 @@ function updateStatusBar(
   if (epics.length === 0) {
     statusBar.command = 'apexDelivery.openDashboard';
     statusBar.text = '$(rocket) APEX Delivery';
-    statusBar.tooltip = 'No delivery epics found. Open the dashboard or create a sample epic.';
+    statusBar.tooltip = 'No delivery epics found. Open the dashboard or create an epic.';
     statusBar.show();
     return;
   }

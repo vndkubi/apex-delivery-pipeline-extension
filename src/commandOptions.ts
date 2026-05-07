@@ -9,6 +9,7 @@ export interface PhaseCommandOptions {
 export interface CreateSampleEpicCommandOptions {
   nonInteractive: boolean;
   workflowId?: string;
+  title?: string;
 }
 
 export interface LinkBranchToEpicCommandOptions {
@@ -103,6 +104,7 @@ export function getCreateSampleEpicCommandOptions(value: unknown): CreateSampleE
     return {
       nonInteractive: value.nonInteractive === true,
       workflowId: typeof value.workflowId === 'string' ? value.workflowId : undefined,
+      title: typeof value.title === 'string' ? value.title : undefined,
     };
   }
 

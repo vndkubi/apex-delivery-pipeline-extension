@@ -260,14 +260,14 @@ export async function run(): Promise<void> {
     uiWorkflowDraft.execution,
     {
       configured: true,
-      mode: 'pooled',
+      mode: 'control',
       commands: {
         runPhase: 'control',
-        reviewPullRequest: 'pooled',
+        reviewPullRequest: 'control',
         openWorkspace: 'pinned',
       },
     },
-    'AC2: Expected the workflow editor draft builder to retain explicit execution policy values.',
+    'AC2: Expected the workflow editor draft builder to normalize deprecated pooled execution values to supported editor routing modes.',
   );
   const uiWorkflowPhaseDraft = uiWorkflowDraft.phases[0];
   assert.ok(uiWorkflowPhaseDraft, 'Expected the workflow editor draft builder to return the first phase.');
@@ -291,14 +291,14 @@ export async function run(): Promise<void> {
   assert.deepStrictEqual(
     serializedUiWorkflow.execution,
     {
-      mode: 'pooled',
+      mode: 'control',
       commands: {
         runPhase: 'control',
-        reviewPullRequest: 'pooled',
+        reviewPullRequest: 'control',
         openWorkspace: 'pinned',
       },
     },
-    'AC2: Expected workflow UI serialization to preserve explicit execution policy values.',
+    'AC2: Expected workflow UI serialization to persist only supported editor routing modes.',
   );
   assert.strictEqual(serializedPhase.templateRef, 'docs/ai-delivery/templates/investigate-template.md', 'AC6: Expected workflow UI serialization to preserve templateRef values.');
   assert.deepStrictEqual(serializedPhase.autopilot, { enabled: true, retryLimit: 1 }, 'AC6: Expected workflow UI serialization to preserve existing autopilot metadata.');
@@ -346,12 +346,16 @@ export async function run(): Promise<void> {
     'C:/workspace',
   );
   assert.ok(
-    workflowConfigHtmlWithExecution.includes('Execution Policy'),
-    'AC4: Expected the workflow configuration webview to expose an execution policy section.',
+    workflowConfigHtmlWithExecution.includes('Workspace Routing'),
+    'AC4: Expected the workflow configuration webview to expose a workspace routing section.',
   );
   assert.ok(
     workflowConfigHtmlWithExecution.includes('Review Pull Request Execution'),
     'AC4: Expected the workflow configuration webview to expose Review Pull Request execution policy controls.',
+  );
+  assert.ok(
+    !workflowConfigHtmlWithExecution.includes('Managed Pool'),
+    'AC4: Expected the workflow configuration webview to stop exposing deprecated Managed Pool routing in the editor.',
   );
   assert.ok(
     !workflowConfigHtmlWithExecution.includes('Model Family'),

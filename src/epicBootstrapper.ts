@@ -25,6 +25,7 @@ export function createSampleEpic(
   templateRoot: string,
   owner: string,
   workflowDefinition: WorkflowDefinition,
+  title = 'AI Delivery Pipeline Pilot',
 ): BootstrapResult {
   return createWorkflowEpic(
     workspaceRoot,
@@ -32,7 +33,7 @@ export function createSampleEpic(
     templateRoot,
     workflowDefinition,
     {
-      title: 'AI Delivery Pipeline Pilot',
+      title,
       owner,
       initialPhaseNote: 'Sample epic created. Start with this workflow entry phase.',
     },

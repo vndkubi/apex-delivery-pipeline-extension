@@ -399,7 +399,7 @@ export class DashboardPanel {
       <div id="filterCount" class="filter-count"></div>
     </section>
     <section class="epic-list">
-      ${snapshot.entries.length === 0 ? '<div class="empty">No epics found yet. Create a sample epic from the tree view to see the full APEX workflow.</div>' : snapshot.entries.map(renderEpicEntry).join('')}
+      ${snapshot.entries.length === 0 ? '<div class="empty">No epics found yet. Create an epic from the tree view to see the full APEX workflow.</div>' : snapshot.entries.map(renderEpicEntry).join('')}
     </section>
   </main>
   <script>

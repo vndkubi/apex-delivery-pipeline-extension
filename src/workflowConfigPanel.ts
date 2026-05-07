@@ -370,6 +370,122 @@ export function buildWorkflowConfigPanelHtml(
     padding: 18px;
     background: linear-gradient(180deg, rgba(15, 23, 42, 0.18), rgba(2, 132, 199, 0.05));
   }
+  .workflow-shell {
+    display: grid;
+    grid-template-columns: minmax(240px, 280px) minmax(360px, 1fr) minmax(320px, 0.9fr);
+    gap: 16px;
+    align-items: start;
+  }
+  .workflow-sidebar,
+  .workflow-detail-panel,
+  .workflow-preview-panel {
+    border: 1px solid rgba(255,255,255,0.10);
+    border-radius: 18px;
+    padding: 16px;
+    background: rgba(255,255,255,0.03);
+  }
+  .workflow-sidebar {
+    position: sticky;
+    top: 12px;
+  }
+  .workflow-outline-list {
+    display: grid;
+    gap: 10px;
+    margin-top: 12px;
+  }
+  .outline-phase {
+    border: 1px solid rgba(255,255,255,0.10);
+    border-radius: 14px;
+    padding: 12px;
+    background: rgba(15, 23, 42, 0.38);
+    cursor: pointer;
+    text-align: left;
+    width: 100%;
+  }
+  .outline-phase.is-active {
+    border-color: rgba(56, 189, 248, 0.50);
+    background: rgba(56, 189, 248, 0.10);
+    box-shadow: inset 0 0 0 1px rgba(56, 189, 248, 0.16);
+  }
+  .outline-phase strong {
+    display: block;
+    margin-bottom: 4px;
+    color: var(--vscode-foreground);
+  }
+  .outline-phase small {
+    display: block;
+    color: var(--muted);
+    line-height: 1.4;
+  }
+  .outline-meta {
+    display: flex;
+    gap: 8px;
+    flex-wrap: wrap;
+    margin-top: 8px;
+  }
+  .outline-pill {
+    border-radius: 999px;
+    padding: 3px 8px;
+    font-size: 11px;
+    color: var(--muted);
+    background: rgba(255,255,255,0.06);
+    border: 1px solid rgba(255,255,255,0.08);
+  }
+  .outline-pill.active {
+    color: #bae6fd;
+    border-color: rgba(56, 189, 248, 0.32);
+    background: rgba(14, 165, 233, 0.14);
+  }
+  .workflow-summary-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(120px, 1fr));
+    gap: 10px;
+    margin-top: 12px;
+  }
+  .workflow-stat {
+    border-radius: 14px;
+    padding: 10px 12px;
+    background: rgba(15, 23, 42, 0.4);
+    border: 1px solid rgba(255,255,255,0.08);
+  }
+  .workflow-stat strong {
+    display: block;
+    font-size: 18px;
+    color: var(--vscode-foreground);
+  }
+  .workflow-stat span {
+    color: var(--muted);
+    font-size: 12px;
+  }
+  .detail-toolbar {
+    display: flex;
+    justify-content: space-between;
+    gap: 12px;
+    align-items: flex-start;
+    margin-bottom: 14px;
+  }
+  .detail-toolbar h3 {
+    margin: 0 0 4px;
+  }
+  .detail-toolbar p {
+    margin: 0;
+    color: var(--muted);
+  }
+  .preview-panel-head {
+    display: flex;
+    justify-content: space-between;
+    gap: 10px;
+    align-items: flex-start;
+    margin-bottom: 10px;
+  }
+  .preview-panel-head h4 {
+    margin: 0 0 4px;
+  }
+  .preview-panel-head p {
+    margin: 0;
+    color: var(--muted);
+    font-size: 12px;
+  }
   .workflow-head, .phase-head {
     display: flex;
     justify-content: space-between;
@@ -472,6 +588,14 @@ export function buildWorkflowConfigPanelHtml(
     .shell { padding: 18px; }
     .hero { flex-direction: column; }
   }
+  @media (max-width: 1180px) {
+    .workflow-shell {
+      grid-template-columns: 1fr;
+    }
+    .workflow-sidebar {
+      position: static;
+    }
+  }
 </style>
 </head>
 <body>
@@ -506,9 +630,11 @@ export function buildWorkflowConfigPanelHtml(
   <script nonce="${nonce}">
     const vscode = acquireVsCodeApi();
     const initial = ${initialState};
+    const persistedState = vscode.getState() || {};
     let draft = deepClone(initial.draft);
     let bundledTemplates = [...initial.bundledTemplates];
     let runtimePreviews = deepClone(initial.runtimePreviews || {});
+    let phaseSelection = persistedState.phaseSelection || {};
     let hostIssues = [];
     let previewUpdateTimer;
 
@@ -585,6 +711,15 @@ export function buildWorkflowConfigPanelHtml(
           container.dataset.previewSurface = target.dataset.surface;
           paintRuntimePreviews();
         }
+        return;
+      }
+
+      if (action === 'select-phase') {
+        if (workflowIndex === undefined || phaseIndex === undefined) {
+          return;
+        }
+        phaseSelection[String(workflowIndex)] = phaseIndex;
+        render();
         return;
       }
 
@@ -877,17 +1012,28 @@ export function buildWorkflowConfigPanelHtml(
       paintValidation();
       paintRuntimePreviews();
       updateSummary();
-      vscode.setState({ draft, bundledTemplates, runtimePreviews });
+      vscode.setState({ draft, bundledTemplates, runtimePreviews, phaseSelection });
       schedulePreviewUpdate();
     }
 
+    function getSelectedPhaseIndex(workflowIndex, workflow) {
+      const selectedIndex = Number(phaseSelection[String(workflowIndex)]);
+      if (Number.isInteger(selectedIndex) && selectedIndex >= 0 && selectedIndex < workflow.phases.length) {
+        return selectedIndex;
+      }
+      return 0;
+    }
+
     function renderWorkflow(workflow, workflowIndex) {
+      const selectedPhaseIndex = getSelectedPhaseIndex(workflowIndex, workflow);
+      const selectedPhase = workflow.phases[selectedPhaseIndex];
+      const enabledPhases = workflow.phases.filter((phase) => phase.enabled !== false).length;
       return '' +
         '<article class="workflow">' +
           '<div class="workflow-head">' +
             '<div>' +
               '<h2>Workflow ' + (workflowIndex + 1) + '</h2>' +
-              '<p>Workspace-scoped flow used when creating new epics. Order is preserved exactly as shown.</p>' +
+              '<p>Workspace-scoped flow used when creating new epics. Outline on the left, editable phase detail in the middle, exact runtime preview on the right.</p>' +
             '</div>' +
             '<div class="workflow-actions">' +
               actionButton('Duplicate', 'duplicate-workflow', workflowIndex, undefined, 'secondary') +
@@ -900,37 +1046,76 @@ export function buildWorkflowConfigPanelHtml(
             renderField('Workflow Id', workflow.id, 'workflow', workflowIndex, undefined, 'id') +
             renderField('Workflow Name', workflow.name, 'workflow', workflowIndex, undefined, 'name') +
           '</div>' +
-          '<div class="section-title">Execution Policy</div>' +
+          '<div class="section-title">Workspace Routing</div>' +
           renderExecutionPolicy(workflow, workflowIndex) +
-          '<div class="section-title">Phases</div>' +
-          '<div class="phase-list">' + workflow.phases.map((phase, phaseIndex) => renderPhase(workflowIndex, phaseIndex, phase)).join('') + '</div>' +
-          '<div style="margin-top: 14px;">' + actionButton('Add Phase', 'add-phase', workflowIndex, undefined, 'secondary') + '</div>' +
+          '<div class="workflow-summary-grid">' +
+            renderWorkflowStat(String(workflow.phases.length), 'Total phases') +
+            renderWorkflowStat(String(enabledPhases), 'Enabled phases') +
+            renderWorkflowStat(selectedPhase ? selectedPhase.name : 'None', 'Selected phase') +
+          '</div>' +
+          '<div class="section-title">Workflow Workbench</div>' +
+          '<div class="workflow-shell">' +
+            renderWorkflowOutline(workflow, workflowIndex, selectedPhaseIndex) +
+            renderPhaseDetail(workflowIndex, selectedPhaseIndex, selectedPhase) +
+            renderPreviewDock(workflowIndex, selectedPhaseIndex, selectedPhase) +
+          '</div>' +
         '</article>';
     }
 
     function renderExecutionPolicy(workflow, workflowIndex) {
       return '' +
         '<div class="field-grid">' +
-          renderSelect('Default Execution', workflow.execution.mode, ['control', 'pooled', 'pinned'], workflowIndex, undefined, 'execution.mode', ['Control Workspace', 'Managed Pool', 'Pinned Workspace']) +
-          renderSelect('Run Phase Execution', workflow.execution.commands.runPhase, ['control', 'pooled', 'pinned'], workflowIndex, undefined, 'execution.commands.runPhase', ['Control Workspace', 'Managed Pool', 'Pinned Workspace']) +
-          renderSelect('Review Pull Request Execution', workflow.execution.commands.reviewPullRequest, ['control', 'pooled', 'pinned'], workflowIndex, undefined, 'execution.commands.reviewPullRequest', ['Control Workspace', 'Managed Pool', 'Pinned Workspace']) +
-          renderSelect('Open Workspace Execution', workflow.execution.commands.openWorkspace, ['control', 'pooled', 'pinned'], workflowIndex, undefined, 'execution.commands.openWorkspace', ['Control Workspace', 'Managed Pool', 'Pinned Workspace']) +
+          renderSelect('Default Execution', workflow.execution.mode, ['control', 'pinned'], workflowIndex, undefined, 'execution.mode', ['Control Workspace', 'Pinned Workspace']) +
+          renderSelect('Run Phase Execution', workflow.execution.commands.runPhase, ['control', 'pinned'], workflowIndex, undefined, 'execution.commands.runPhase', ['Control Workspace', 'Pinned Workspace']) +
+          renderSelect('Review Pull Request Execution', workflow.execution.commands.reviewPullRequest, ['control', 'pinned'], workflowIndex, undefined, 'execution.commands.reviewPullRequest', ['Control Workspace', 'Pinned Workspace']) +
+          renderSelect('Open Workspace Execution', workflow.execution.commands.openWorkspace, ['control', 'pinned'], workflowIndex, undefined, 'execution.commands.openWorkspace', ['Control Workspace', 'Pinned Workspace']) +
         '</div>' +
-        '<div class="hint">Execution policy is snapshotted into new epics. This phase stores workflow policy only; pooled auto-routing is not enabled yet.</div>';
+        '<div class="hint">Execution routing is snapshotted into new epics. Use Control Workspace for the current VS Code window, or Pinned Workspace when branch-bound work should stay on the linked worktree.</div>';
     }
 
-    function renderPhase(workflowIndex, phaseIndex, phase) {
+    function renderWorkflowOutline(workflow, workflowIndex, selectedPhaseIndex) {
+      return '<aside class="workflow-sidebar">' +
+        '<div class="detail-toolbar">' +
+          '<div>' +
+            '<h3>Outline</h3>' +
+            '<p>Choose a phase to edit and preview.</p>' +
+          '</div>' +
+        '</div>' +
+        '<div class="workflow-outline-list">' +
+          workflow.phases.map((phase, phaseIndex) => renderOutlinePhase(workflowIndex, phaseIndex, phase, phaseIndex === selectedPhaseIndex)).join('') +
+        '</div>' +
+        '<div style="margin-top: 14px;">' + actionButton('Add Phase', 'add-phase', workflowIndex, undefined, 'secondary') + '</div>' +
+      '</aside>';
+    }
+
+    function renderOutlinePhase(workflowIndex, phaseIndex, phase, active) {
+      return '<button type="button" class="outline-phase' + (active ? ' is-active' : '') + '" data-action="select-phase" data-workflow-index="' + workflowIndex + '" data-phase-index="' + phaseIndex + '">' +
+        '<strong>' + escapeHtml((phaseIndex + 1) + '. ' + (phase.name || 'New Phase')) + '</strong>' +
+        '<small>' + escapeHtml(phase.artifact || 'No artifact') + '</small>' +
+        '<div class="outline-meta">' +
+          '<span class="outline-pill' + (active ? ' active' : '') + '">' + escapeHtml(phase.owner || 'No owner') + '</span>' +
+          '<span class="outline-pill">' + escapeHtml(phase.enabled === false ? 'Disabled' : 'Enabled') + '</span>' +
+          '<span class="outline-pill">' + escapeHtml(phase.sessionDefaults?.preferredChatAgent || 'No agent hint') + '</span>' +
+        '</div>' +
+      '</button>';
+    }
+
+    function renderPhaseDetail(workflowIndex, phaseIndex, phase) {
+      if (!phase) {
+        return '<section class="workflow-detail-panel"><div class="empty">Select a phase to edit its detail and runtime behavior.</div></section>';
+      }
+
       const templateControl = renderTemplateControl(workflowIndex, phaseIndex, phase);
       const autopilotNote = phase.autopilot
         ? '<div class="autopilot-note">Autopilot metadata is preserved on save. Current snapshot: enabled=' + String(phase.autopilot.enabled ?? false) + ', retryLimit=' + String(phase.autopilot.retryLimit ?? 'inherit') + ', pauseOnManualIntervention=' + String(phase.autopilot.pauseOnManualIntervention ?? 'inherit') + '.</div>'
         : '';
 
       return '' +
-        '<section class="phase">' +
-          '<div class="phase-head">' +
+        '<section class="workflow-detail-panel">' +
+          '<div class="detail-toolbar">' +
             '<div>' +
-              '<h3>Phase ' + (phaseIndex + 1) + '</h3>' +
-              '<p>Edit artifact routing, larger file-backed text inputs, and run defaults for this phase.</p>' +
+              '<h3>Phase Detail</h3>' +
+              '<p>Edit artifact routing, file-backed inputs, and phase run defaults for the selected step.</p>' +
             '</div>' +
             '<div class="phase-actions">' +
               actionButton('Up', 'move-phase-up', workflowIndex, phaseIndex, 'ghost') +
@@ -965,16 +1150,30 @@ export function buildWorkflowConfigPanelHtml(
             renderField('Preferred Chat Agent', phase.sessionDefaults.preferredChatAgent, 'phase', workflowIndex, phaseIndex, 'sessionDefaults.preferredChatAgent') +
             renderField('Agent Tag', phase.sessionDefaults.agentTag, 'phase', workflowIndex, phaseIndex, 'sessionDefaults.agentTag') +
           '</div>' +
-          '<div class="section-title">Effective Run Preview</div>' +
-          renderRunPreview(workflowIndex, phaseIndex) +
           autopilotNote +
         '</section>';
+    }
+
+    function renderPreviewDock(workflowIndex, phaseIndex, phase) {
+      return '<aside class="workflow-preview-panel">' +
+        '<div class="preview-panel-head">' +
+          '<div>' +
+            '<h4>Runtime Preview</h4>' +
+            '<p>' + escapeHtml(phase ? ('Exact rendered prompt and resolved run settings for ' + phase.name + '.') : 'Select a phase to inspect the rendered runtime plan.') + '</p>' +
+          '</div>' +
+        '</div>' +
+        renderRunPreview(workflowIndex, phaseIndex) +
+      '</aside>';
+    }
+
+    function renderWorkflowStat(value, label) {
+      return '<div class="workflow-stat"><strong>' + escapeHtml(value) + '</strong><span>' + escapeHtml(label) + '</span></div>';
     }
 
     function renderRunPreview(workflowIndex, phaseIndex) {
       const key = previewKey(workflowIndex, phaseIndex);
       return '<div class="field full-span preview-card" data-preview-key="' + key + '">' +
-        '<div class="hint">Support: Starter Prompt <strong>Active</strong> · Auto Submit <strong>Active</strong> · Preferred Chat Agent <strong>Best effort</strong> · Execution Policy <strong>Preview / Guardrail</strong></div>' +
+        '<div class="hint">Support: Starter Prompt <strong>Active</strong> · Auto Submit <strong>Active</strong> · Preferred Chat Agent <strong>Best effort</strong> · Workspace Routing <strong>Guardrail</strong></div>' +
         '<div class="field-grid" style="margin-top: 8px;">' +
           '<div class="workflow-actions">' +
             previewSurfaceButton('Built-in Chat', 'scopedChat', workflowIndex, phaseIndex) +
@@ -1177,16 +1376,16 @@ export function buildWorkflowConfigPanelHtml(
         }
 
         if (!isValidExecutionMode(workflow.execution?.mode)) {
-          issues.push({ path: 'workflow.' + workflowIndex + '.execution.mode', message: 'Default execution must be control, pooled, or pinned.' });
+          issues.push({ path: 'workflow.' + workflowIndex + '.execution.mode', message: 'Default execution must be control or pinned.' });
         }
         if (!isValidExecutionMode(workflow.execution?.commands?.runPhase)) {
-          issues.push({ path: 'workflow.' + workflowIndex + '.execution.commands.runPhase', message: 'Run Phase execution must be control, pooled, or pinned.' });
+          issues.push({ path: 'workflow.' + workflowIndex + '.execution.commands.runPhase', message: 'Run Phase execution must be control or pinned.' });
         }
         if (!isValidExecutionMode(workflow.execution?.commands?.reviewPullRequest)) {
-          issues.push({ path: 'workflow.' + workflowIndex + '.execution.commands.reviewPullRequest', message: 'Review Pull Request execution must be control, pooled, or pinned.' });
+          issues.push({ path: 'workflow.' + workflowIndex + '.execution.commands.reviewPullRequest', message: 'Review Pull Request execution must be control or pinned.' });
         }
         if (!isValidExecutionMode(workflow.execution?.commands?.openWorkspace)) {
-          issues.push({ path: 'workflow.' + workflowIndex + '.execution.commands.openWorkspace', message: 'Open Workspace execution must be control, pooled, or pinned.' });
+          issues.push({ path: 'workflow.' + workflowIndex + '.execution.commands.openWorkspace', message: 'Open Workspace execution must be control or pinned.' });
         }
 
         if (!Array.isArray(workflow.phases) || workflow.phases.length === 0) {
@@ -1349,7 +1548,7 @@ export function buildWorkflowConfigPanelHtml(
     }
 
     function isValidExecutionMode(value) {
-      return value === 'control' || value === 'pooled' || value === 'pinned';
+      return value === 'control' || value === 'pinned';
     }
 
     function isValidWorkspaceRelativePath(value) {
@@ -1481,7 +1680,7 @@ function buildWorkflowRuntimePreviews(
         rawPhaseProfiles,
       });
       const promptSurfaces = buildPhasePromptSurfaces({
-        sessionMarker: 'APEX_SESSION=preview-session',
+        sessionMarker: '',
         workspaceRootDisplayPath: workspaceRoot || '<workspace>',
         epicDisplayPath: path.join(sampleRoot, 'EPIC.md'),
         artifactDisplayPath: path.join(sampleRoot, phase.artifact || 'PHASE.md'),
