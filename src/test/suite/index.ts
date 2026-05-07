@@ -20,14 +20,21 @@ import type { EpicStatus, PhaseStatus } from '../../pipelineModel';
 import { PipelineScanner } from '../../pipelineScanner';
 import {
   buildWorkflowEditorDraft,
+  buildWorkflowPresetDrafts,
   serializeWorkflowEditorDraft,
   validateWorkflowEditorDraft,
 } from '../../workflowConfigModel';
 import { buildWorkflowConfigPanelHtml } from '../../workflowConfigPanel';
-import { parseWorkflowDefinitions } from '../../workflowModel';
+import { buildCopilotCliHandoff, computePbiReviewScore } from '../../pbiWorkflow';
+import {
+  getBuiltInWorkflowDefinitions,
+  parseWorkflowDefinitions,
+} from '../../workflowModel';
+import { runSessionRoutingSmokeSuite } from './sessionRouting.test';
+import { runWorktreePoolSmokeSuite } from './worktreePool.test';
 
 interface SmokeCommandResult {
-  mode: 'agent-chat' | 'direct' | 'chat-fallback' | 'blocked';
+  mode: 'agent-chat' | 'direct' | 'chat-fallback' | 'cli-handoff' | 'blocked';
   artifactPath: string;
   sessionId?: string;
   transportId?: string;
@@ -57,6 +64,8 @@ interface SmokeCommandResult {
     preferredRole?: string;
     status: 'not-configured' | 'not-required' | 'matched' | 'mismatched';
   };
+  handoffPath?: string;
+  handoffCommand?: string;
 }
 
 interface IntegratedFlowCommandResult {
@@ -118,6 +127,8 @@ interface OpenLinkedBranchWorktreeCommandResult {
 }
 
 export async function run(): Promise<void> {
+  runSessionRoutingSmokeSuite();
+
   const extension = vscode.extensions.getExtension('vndkubi.apex-delivery-pipeline-v1');
   assert.ok(extension, 'Expected APEX extension to be present in the extension host');
   await extension.activate();
@@ -171,9 +182,49 @@ export async function run(): Promise<void> {
     'AC2: Expected invalid workflow templateRef values to surface a parser error.',
   );
 
+  const invalidExecutionDefinitions = parseWorkflowDefinitions({
+    'invalid-execution-policy': {
+      name: 'Invalid Execution Policy',
+      execution: {
+        mode: 'auto',
+      },
+      phases: [
+        {
+          id: 'discover',
+          name: 'Discover',
+          owner: 'Business Analyst',
+          artifact: 'DISCOVERY.md',
+          gate: 'Gate 1',
+          output: 'Problem baseline captured',
+        },
+      ],
+    },
+  });
+  assert.ok(
+    invalidExecutionDefinitions.errors.some((error) => /execution\.mode/.test(error)),
+    'AC2: Expected invalid workflow execution policy values to surface a parser error.',
+  );
+
+  const builtInWorkflows = getBuiltInWorkflowDefinitions();
+  assert.ok(
+    builtInWorkflows.some((workflow) => workflow.id === 'pbi-delivery'),
+    'Expected the built-in workflow set to include the PBI Delivery preset.',
+  );
+  const pbiPresetDraft = buildWorkflowPresetDrafts()[0];
+  assert.ok(pbiPresetDraft, 'Expected a workflow editor preset draft for PBI Delivery.');
+  assert.strictEqual(pbiPresetDraft?.phases[0]?.artifact, 'PBI.md', 'Expected the PBI Delivery preset draft to start with the intake artifact.');
+
   const builtWorkflowDraft = buildWorkflowEditorDraft(parseWorkflowDefinitions({
     'ui-workflow': {
       name: 'UI Workflow',
+      execution: {
+        mode: 'pooled',
+        commands: {
+          runPhase: 'control',
+          reviewPullRequest: 'pooled',
+          openWorkspace: 'pinned',
+        },
+      },
       phases: [
         {
           id: 'discover',
@@ -205,6 +256,19 @@ export async function run(): Promise<void> {
   );
   const uiWorkflowDraft = builtWorkflowDraft.workflows[0];
   assert.ok(uiWorkflowDraft, 'Expected the workflow editor draft builder to return the workspace workflow.');
+  assert.deepStrictEqual(
+    uiWorkflowDraft.execution,
+    {
+      configured: true,
+      mode: 'pooled',
+      commands: {
+        runPhase: 'control',
+        reviewPullRequest: 'pooled',
+        openWorkspace: 'pinned',
+      },
+    },
+    'AC2: Expected the workflow editor draft builder to retain explicit execution policy values.',
+  );
   const uiWorkflowPhaseDraft = uiWorkflowDraft.phases[0];
   assert.ok(uiWorkflowPhaseDraft, 'Expected the workflow editor draft builder to return the first phase.');
   const serializedWorkflowDraft = serializeWorkflowEditorDraft({
@@ -221,18 +285,43 @@ export async function run(): Promise<void> {
       },
     ],
   });
-  const serializedPhase = ((serializedWorkflowDraft['ui-workflow'] as { phases: Array<Record<string, unknown>> }).phases[0]);
+  const serializedUiWorkflow = (serializedWorkflowDraft['ui-workflow'] as { execution?: Record<string, unknown>; phases: Array<Record<string, unknown>> });
+  const serializedPhase = serializedUiWorkflow.phases[0];
   assert.ok(serializedPhase, 'Expected serialized workflow draft to include the first phase.');
+  assert.deepStrictEqual(
+    serializedUiWorkflow.execution,
+    {
+      mode: 'pooled',
+      commands: {
+        runPhase: 'control',
+        reviewPullRequest: 'pooled',
+        openWorkspace: 'pinned',
+      },
+    },
+    'AC2: Expected workflow UI serialization to preserve explicit execution policy values.',
+  );
   assert.strictEqual(serializedPhase.templateRef, 'docs/ai-delivery/templates/investigate-template.md', 'AC6: Expected workflow UI serialization to preserve templateRef values.');
   assert.deepStrictEqual(serializedPhase.autopilot, { enabled: true, retryLimit: 1 }, 'AC6: Expected workflow UI serialization to preserve existing autopilot metadata.');
   const workflowConfigHtml = buildWorkflowConfigPanelHtml(
     { cspSource: 'vscode-webview-resource://test' },
     { workflows: [] },
     ['DESIGN.md', 'REVIEW.md'],
+    'C:/workspace',
   );
   assert.ok(
     workflowConfigHtml.includes('split(String.fromCharCode(92)).join(\'/\')'),
     'Expected the workflow configuration webview script to use a safe backslash-normalization path inside the generated HTML.',
+  );
+  assert.ok(
+    workflowConfigHtml.includes('/^[a-zA-Z]:\\//.test(value)'),
+    'AC1: Expected the workflow configuration webview script to preserve the absolute-path regex escape sequence in the emitted HTML.',
+  );
+  const workflowConfigScripts = [...workflowConfigHtml.matchAll(/<script[^>]*>([\s\S]*?)<\/script>/g)];
+  assert.ok(workflowConfigScripts.length > 0, 'AC1: Expected the workflow configuration webview HTML to include an inline script.');
+  const workflowConfigScript = workflowConfigScripts[workflowConfigScripts.length - 1]?.[1] ?? '';
+  assert.doesNotThrow(
+    () => new Function(workflowConfigScript),
+    'AC1: Expected the workflow configuration webview script to stay syntactically valid so Add Workflow can initialize.',
   );
   assert.ok(
     workflowConfigHtml.includes('No workspace workflows yet.'),
@@ -249,6 +338,24 @@ export async function run(): Promise<void> {
   assert.ok(
     workflowConfigHtml.includes('File Reference'),
     'Expected the workflow configuration webview to expose inline or file reference modes for longer text fields.',
+  );
+  const workflowConfigHtmlWithExecution = buildWorkflowConfigPanelHtml(
+    { cspSource: 'vscode-webview-resource://test' },
+    builtWorkflowDraft,
+    ['DESIGN.md', 'REVIEW.md'],
+    'C:/workspace',
+  );
+  assert.ok(
+    workflowConfigHtmlWithExecution.includes('Execution Policy'),
+    'AC4: Expected the workflow configuration webview to expose an execution policy section.',
+  );
+  assert.ok(
+    workflowConfigHtmlWithExecution.includes('Review Pull Request Execution'),
+    'AC4: Expected the workflow configuration webview to expose Review Pull Request execution policy controls.',
+  );
+  assert.ok(
+    !workflowConfigHtmlWithExecution.includes('Model Family'),
+    'AC4: Expected the workflow configuration webview to stop exposing deprecated model family inputs for chat-first workflows.',
   );
 
   const workflowTextRefPath = path.join(workspaceRoot, 'docs', 'ai-delivery', 'prompts', 'discover-output.md');
@@ -345,6 +452,8 @@ export async function run(): Promise<void> {
     'Expected workflow UI serialization to preserve starterPromptRef values with the cached file content.',
   );
 
+  runWorktreePoolSmokeSuite(workspaceRoot);
+
   const integratedFlow = await vscode.commands.executeCommand<IntegratedFlowCommandResult>('apexDelivery.startIntegratedFlow', {
     nonInteractive: true,
     openSpec: true,
@@ -352,11 +461,59 @@ export async function run(): Promise<void> {
   assert.ok(integratedFlow, 'Expected the integrated delivery flow to return a result');
   assert.ok(fs.existsSync(integratedFlow.specFilePath), 'Expected integrated delivery flow to create spec.md');
   assert.ok(fs.existsSync(integratedFlow.copilotInstructionsPath), 'Expected integrated delivery flow to create the Copilot bootstrap pack');
+  const generatedTddPromptPath = path.join(workspaceRoot, '.github', 'prompts', 'apex-tdd-epic.prompt.md');
+  const generatedTddInstructionsPath = path.join(workspaceRoot, '.github', 'instructions', 'apex-tdd-micro-commit.instructions.md');
+  const generatedTddAgentPath = path.join(workspaceRoot, '.github', 'agents', 'apex-tdd-epic-executor.agent.md');
+  assert.ok(fs.existsSync(generatedTddPromptPath), 'AC6: Expected the Copilot bootstrap pack to create a reusable TDD epic prompt.');
+  assert.ok(fs.existsSync(generatedTddInstructionsPath), 'AC6: Expected the Copilot bootstrap pack to create scoped TDD instructions.');
+  assert.ok(fs.existsSync(generatedTddAgentPath), 'AC6: Expected the Copilot bootstrap pack to create a TDD epic executor agent.');
+  const generatedCopilotInstructions = fs.readFileSync(integratedFlow.copilotInstructionsPath, 'utf8');
+  assert.ok(!generatedCopilotInstructions.includes('VI:'), 'AC6: Expected generated Copilot instructions to use English only.');
+  const generatedTddInstructions = fs.readFileSync(generatedTddInstructionsPath, 'utf8');
+  assert.ok(/applyTo:\s+"\*\*\/\*\.{/.test(generatedTddInstructions), 'AC6: Expected generated TDD instructions to target multi-language source files rather than a single language tree.');
+  assert.ok(generatedTddInstructions.includes('py'), 'AC6: Expected generated TDD instructions to mention at least one non-TypeScript language extension.');
+  const generatedTddAgent = fs.readFileSync(generatedTddAgentPath, 'utf8');
+  assert.ok(generatedTddAgent.includes('TDD Epic Executor'), 'AC6: Expected the generated TDD agent to expose a dedicated executor identity.');
   assert.strictEqual(
     vscode.window.activeTextEditor?.document.uri.fsPath,
     integratedFlow.specFilePath,
     'Expected the quick-start flow to open spec.md automatically',
   );
+
+  const initialPbiKeys = new Set(new PipelineScanner(workspaceRoot, 'docs/ai-delivery/epics').scanAll().map((candidate) => candidate.key));
+  await vscode.commands.executeCommand('apexDelivery.createPbiDelivery', {
+    title: 'Daily PBI Smoke',
+    text: 'As a reviewer, I need a PBI-aware review artifact so that daily technical review stays tied to requirements.',
+    source: 'jira',
+  });
+  const pbiEpic = await waitForNewEpic(workspaceRoot, initialPbiKeys);
+  assert.strictEqual(pbiEpic.workflowId, 'pbi-delivery', 'Expected Create PBI Delivery to use the built-in PBI workflow.');
+  assert.ok(fs.existsSync(path.join(pbiEpic.folderPath, 'PBI.md')), 'Expected Create PBI Delivery to seed PBI.md.');
+  assert.match(
+    fs.readFileSync(path.join(pbiEpic.folderPath, 'PBI.md'), 'utf8'),
+    /PBI-aware review artifact/i,
+    'Expected imported PBI text to be written into PBI.md.',
+  );
+  const pbiReviewScore = computePbiReviewScore(pbiEpic);
+  assert.ok(pbiReviewScore.score > 0, 'Expected PBI review scoring to produce a non-zero readiness score for a seeded epic.');
+  const previewHandoff = buildCopilotCliHandoff(workspaceRoot, pbiEpic, pbiEpic.phases[0]!, 'Prompt preview');
+  assert.match(previewHandoff.command, /^copilot -p "@docs\/ai-delivery\/epics\/APEX-\d+\/handoffs\/copilot-cli\/intake\.prompt\.md"$/, 'Expected Copilot CLI handoff commands to point at the epic-relative prompt file.');
+  assert.ok(fs.existsSync(previewHandoff.promptPath), 'Expected the direct Copilot CLI handoff helper to write the prompt file.');
+
+  await vscode.workspace.getConfiguration('apexDelivery').update('copilot.provider', 'copilotCliPrompt', vscode.ConfigurationTarget.Workspace);
+  const pbiCliResult = await vscode.commands.executeCommand<SmokeCommandResult>('apexDelivery.runPhaseInCopilot', {
+    epic: pbiEpic,
+    phase: pbiEpic.phases[0],
+    nonInteractive: true,
+  });
+  assert.ok(pbiCliResult, 'Expected Run Phase with Copilot to return a result for PBI CLI handoff mode.');
+  assert.strictEqual(pbiCliResult?.mode, 'cli-handoff', 'Expected the Copilot provider switch to generate a CLI handoff instead of launching VS Code Copilot.');
+  assert.ok(pbiCliResult?.handoffPath && fs.existsSync(pbiCliResult.handoffPath), 'Expected the CLI handoff result to return a prompt path that exists on disk.');
+  assert.match(pbiCliResult?.handoffCommand ?? '', /^copilot -p "@docs\/ai-delivery\/epics\/APEX-\d+\/handoffs\/copilot-cli\/intake\.prompt\.md"$/, 'Expected the CLI handoff result to expose a terminal-safe copilot -p command.');
+  const pbiEvidenceResult = await vscode.commands.executeCommand<{ artifactPath?: string; score?: { score: number } }>('apexDelivery.generateEvidencePack', pbiEpic);
+  assert.ok(pbiEvidenceResult?.artifactPath && fs.existsSync(pbiEvidenceResult.artifactPath), 'Expected Generate Evidence Pack to write EVIDENCE.md for the PBI epic.');
+  assert.ok((pbiEvidenceResult?.score?.score ?? 0) > 0, 'Expected Generate Evidence Pack to return the computed PBI review score.');
+  await vscode.workspace.getConfiguration('apexDelivery').update('copilot.provider', 'vscodeBuiltIn', vscode.ConfigurationTarget.Workspace);
 
   await vscode.commands.executeCommand('workbench.action.closeAllEditors');
 
@@ -372,6 +529,14 @@ export async function run(): Promise<void> {
   const configuredWorkflows = {
     'investigate-workflow': {
       name: 'Investigate Only',
+      execution: {
+        mode: 'pooled',
+        commands: {
+          runPhase: 'control',
+          reviewPullRequest: 'pooled',
+          openWorkspace: 'pinned',
+        },
+      },
       phases: [
         {
           id: 'investigate',
@@ -422,6 +587,18 @@ export async function run(): Promise<void> {
   });
   const epic = await waitForNewEpic(workspaceRoot, initialEpicKeys);
   assert.strictEqual(epic.workflowId, 'investigate-workflow', 'Expected the sample epic to carry the selected workflow id');
+  assert.deepStrictEqual(
+    epic.execution,
+    {
+      mode: 'pooled',
+      commands: {
+        runPhase: 'control',
+        reviewPullRequest: 'pooled',
+        openWorkspace: 'pinned',
+      },
+    },
+    'AC3: Expected the sample epic snapshot to retain workflow execution policy even when the workflow has no implement phase.',
+  );
   assert.deepStrictEqual(
     epic.phases.map((candidate) => candidate.id),
     ['investigate', 'triage', 'handoff'],
@@ -692,7 +869,7 @@ export async function run(): Promise<void> {
   assert.strictEqual(result.chatLaunchResult, 'opened', 'AC1: Expected rerunning fallback for the same epic to reopen the existing chat session rather than prefill a new ask chat');
   assert.strictEqual(result.runPreferences?.preferredChatAgent, 'Business Analyst', 'AC2: Expected explicit phase profile overrides to win over workflow and role defaults.');
   assert.strictEqual(result.runPreferences?.agentTag, '#workflow-investigate', 'AC2: Expected workflow defaults to win over role defaults when no explicit phase profile agentTag override exists.');
-  assert.strictEqual(result.runPreferences?.modelFamily, 'gpt-4.1', 'AC2: Expected workflow defaults to win over role defaults for model family.');
+  assert.strictEqual(result.runPreferences?.modelFamily, undefined, 'AC2: Expected deprecated model family preferences to be ignored in chat-first run preferences.');
   assert.strictEqual(result.runPreferences?.starterPrompt, 'Profile override starter prompt.', 'AC2: Expected explicit phase profile starter prompts to win over workflow and role defaults.');
   assert.strictEqual(result.rolePolicyResolution?.status, 'mismatched', 'Expected the current user role to mismatch the phase owner');
   assert.strictEqual(result.rolePolicyResolution?.userRole, 'Developer', 'Expected the role-aware resolver to record the configured user role');
@@ -706,7 +883,7 @@ export async function run(): Promise<void> {
   assert.ok(typeof result.chatStarter === 'string' && result.chatStarter.includes(epic.key), 'Expected the reopened fallback prompt to mention the current epic key');
   assert.ok(typeof result.chatStarter === 'string' && result.chatStarter.includes('Preferred GitHub Copilot Chat agent: Business Analyst.'), 'AC3: Expected the reopened fallback prompt to preserve the preferred agent hint.');
   assert.ok(typeof result.chatStarter === 'string' && result.chatStarter.includes('#workflow-investigate'), 'AC2: Expected workflow-scoped agentTag defaults to flow into the reopened fallback prompt.');
-  assert.ok(typeof result.chatStarter === 'string' && result.chatStarter.includes('Preferred model family hint: gpt-4.1.'), 'AC3: Expected the reopened fallback prompt to preserve the model preference hint.');
+  assert.ok(typeof result.chatStarter === 'string' && !result.chatStarter.includes('Preferred model family hint:'), 'AC3: Expected the reopened fallback prompt to omit model preference hints because the chat UI picker is the source of truth.');
   assert.ok(typeof result.chatStarter === 'string' && result.chatStarter.includes('Profile override starter prompt.'), 'AC5: Expected workflow-scoped starter prompt content to remain in the reopened fallback prompt.');
 
   const agentLaunches: Array<{ command: string; args: readonly unknown[] }> = [];
@@ -740,7 +917,7 @@ export async function run(): Promise<void> {
   };
   assert.strictEqual(agentRequest.mode, 'agent', 'Expected the Copilot chat command to open in agent mode');
   assert.ok(typeof agentRequest.query === 'string' && agentRequest.query.includes('Update the attached phase artifact'), 'Expected the agent prompt to target the attached phase artifact');
-  assert.ok(typeof agentRequest.query === 'string' && agentRequest.query.includes('Preferred model family hint: gpt-4.1.'), 'AC3: Expected agent-mode launches to surface model preference as a best-effort hint only.');
+  assert.ok(typeof agentRequest.query === 'string' && !agentRequest.query.includes('Preferred model family hint:'), 'AC3: Expected agent-mode launches to omit model preference hints because the chat UI picker is the source of truth.');
   assert.ok(typeof agentRequest.query === 'string' && agentRequest.query.includes('Profile override starter prompt.'), 'AC5: Expected workflow starter prompt content to be included in the agent-mode launch prompt.');
   assert.strictEqual(agentRequest.isPartialQuery, undefined, 'Expected agent auto-submit to omit partial-query mode');
   assert.ok(Array.isArray(agentRequest.attachFiles) && agentRequest.attachFiles.length >= 3, 'Expected the phase artifact, epic brief, and status file to be attached to the agent request');
@@ -953,7 +1130,7 @@ export async function run(): Promise<void> {
   });
   assert.ok(blockedLinkedReviewResult, 'Expected linked PR review to return a result when blocked for a missing worktree.');
   assert.strictEqual(blockedLinkedReviewResult.mode, 'blocked', 'Expected linked PR review to block until the linked branch worktree exists.');
-  assert.match(blockedLinkedReviewResult.blockedReason ?? '', /Open Linked Branch Worktree/i, 'Expected blocked linked PR review to direct the user to open the linked branch worktree.');
+  assert.match(blockedLinkedReviewResult.blockedReason ?? '', /Open Pinned Branch Workspace/i, 'Expected blocked linked PR review to direct the user to open the pinned branch workspace.');
   assert.ok(!fs.existsSync(missingWorktreeReviewPath), 'Expected blocked linked PR review to avoid writing review artifacts in the control workspace.');
 
   const linkedWorktreeOpenRequests: Array<{ folderUri: vscode.Uri; forceNewWindow?: boolean }> = [];
@@ -1060,21 +1237,6 @@ export async function run(): Promise<void> {
 
   await vscode.commands.executeCommand('workbench.action.closeAllEditors');
   console.log(`APEX smoke test passed with mode: ${result.mode} (${result.chatLaunchResult ?? 'unknown'})`);
-}
-
-async function waitForEpic(workspaceRoot: string): Promise<EpicStatus> {
-  const scanner = new PipelineScanner(workspaceRoot, 'docs/ai-delivery/epics');
-  const timeout = Date.now() + 10_000;
-
-  while (Date.now() < timeout) {
-    const [epic] = scanner.scanAll();
-    if (epic) {
-      return epic;
-    }
-    await delay(200);
-  }
-
-  throw new Error('Timed out waiting for sample epic creation');
 }
 
 async function waitForNewEpic(workspaceRoot: string, existingKeys: ReadonlySet<string>): Promise<EpicStatus> {

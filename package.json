@@ -2,7 +2,7 @@
   "name": "apex-delivery-pipeline-v1",
   "displayName": "APEX Delivery Pipeline for Copilot",
   "description": "A Copilot-first VS Code extension for file-based APEX delivery epics, scoped phase runs, workflow editing, branch-linked worktrees, PR review artifacts, MCP setup, and developer traceability.",
-  "version": "0.5.6",
+  "version": "0.5.8",
   "publisher": "vndkubi",
   "license": "MIT",
   "repository": {
@@ -136,6 +136,10 @@
                       "type": "string",
                       "description": "Artifact filename created from the extension templates, for example DISCOVER.md or REVIEW.md."
                     },
+                    "enabled": {
+                      "type": "boolean",
+                      "description": "When false, the phase stays in workflow configuration but is skipped when new epics snapshot the workflow."
+                    },
                     "templateRef": {
                       "type": "string",
                       "description": "Optional template source for this phase. Use a bundled generic template filename like DISCOVERY.md or a workspace-relative markdown path like docs/templates/custom/discovery.md."
@@ -192,10 +196,6 @@
                           "type": "string",
                           "description": "Optional human-readable preferred GitHub Copilot Chat agent for this phase."
                         },
-                        "modelFamily": {
-                          "type": "string",
-                          "description": "Preferred model family for extension-owned direct execution for this phase. Public Chat launches can only treat this as a hint."
-                        },
                         "starterPrompt": {
                           "type": "string",
                           "description": "Optional workflow-specific starter prompt appended to the scoped phase instructions."
@@ -203,6 +203,15 @@
                         "starterPromptRef": {
                           "type": "string",
                           "description": "Optional workspace-relative file path used as the source for the workflow-specific starter prompt. The extension keeps `starterPrompt` as the cached fallback snapshot."
+                        },
+                        "starterPromptPlacement": {
+                          "type": "string",
+                          "enum": [
+                            "prepend",
+                            "append",
+                            "replace"
+                          ],
+                          "description": "Controls whether the starter prompt is prepended, appended, or used to replace the base Copilot phase prompt."
                         }
                       }
                     }
@@ -232,15 +241,29 @@
           "default": "",
           "description": "Optional human-readable preferred GitHub Copilot Chat agent name, for example 'Business Analyst' or 'Code Reviewer'."
         },
-        "apexDelivery.runPhase.modelFamily": {
-          "type": "string",
-          "default": "gpt-4.1",
-          "description": "Preferred model family for extension-driven direct execution or direct fallback. GitHub Copilot Chat model selection still follows the active chat UI."
-        },
         "apexDelivery.runPhase.starterPrompt": {
           "type": "string",
           "default": "",
           "description": "Optional workspace-wide starter prompt appended to the scoped Run Phase instructions."
+        },
+        "apexDelivery.runPhase.starterPromptPlacement": {
+          "type": "string",
+          "default": "prepend",
+          "enum": [
+            "prepend",
+            "append",
+            "replace"
+          ],
+          "description": "Controls whether the workspace starter prompt is prepended, appended, or used to replace the base Copilot phase prompt."
+        },
+        "apexDelivery.copilot.provider": {
+          "type": "string",
+          "default": "vscodeBuiltIn",
+          "enum": [
+            "vscodeBuiltIn",
+            "copilotCliPrompt"
+          ],
+          "markdownDescription": "Controls how Run Phase with Copilot launches work. `vscodeBuiltIn` uses the VS Code Chat and language-model integrations. `copilotCliPrompt` generates a traceable Copilot CLI prompt handoff file and command instead of auto-running the CLI."
         },
         "apexDelivery.runPhase.phaseProfiles": {
           "type": "object",
@@ -263,13 +286,18 @@
                   "type": "string",
                   "description": "Optional preferred GitHub Copilot Chat agent name for this phase, for example 'Business Analyst' or 'Code Reviewer'."
                 },
-                "modelFamily": {
-                  "type": "string",
-                  "description": "Preferred model family for extension-driven direct execution or direct fallback for this phase."
-                },
                 "starterPrompt": {
                   "type": "string",
                   "description": "Optional workflow-scoped starter prompt appended to the scoped phase instructions for this phase."
+                },
+                "starterPromptPlacement": {
+                  "type": "string",
+                  "enum": [
+                    "prepend",
+                    "append",
+                    "replace"
+                  ],
+                  "description": "Controls whether the starter prompt is prepended, appended, or used to replace the base phase prompt."
                 }
               }
             }
@@ -294,13 +322,18 @@
                 "type": "string",
                 "description": "Default preferred GitHub Copilot Chat agent for this role."
               },
-              "modelFamily": {
-                "type": "string",
-                "description": "Default direct-execution model family for this role."
-              },
               "starterPrompt": {
                 "type": "string",
                 "description": "Default starter prompt appended to scoped phase instructions for this role."
+              },
+              "starterPromptPlacement": {
+                "type": "string",
+                "enum": [
+                  "prepend",
+                  "append",
+                  "replace"
+                ],
+                "description": "Controls whether the role starter prompt is prepended, appended, or used to replace the base phase prompt."
               }
             }
           }
@@ -378,9 +411,39 @@
         "category": "APEX Delivery"
       },
       {
+        "command": "apexDelivery.createPbiDelivery",
+        "title": "Create PBI Delivery",
+        "icon": "$(note-add)",
+        "category": "APEX Delivery"
+      },
+      {
+        "command": "apexDelivery.importPbiFromText",
+        "title": "Import PBI From Text",
+        "icon": "$(inbox)",
+        "category": "APEX Delivery"
+      },
+      {
+        "command": "apexDelivery.bindBranchToEpic",
+        "title": "Bind Branch To Epic",
+        "icon": "$(git-branch)",
+        "category": "APEX Delivery"
+      },
+      {
+        "command": "apexDelivery.manageCurrentBranchBinding",
+        "title": "Manage Current Branch Binding",
+        "icon": "$(link)",
+        "category": "APEX Delivery"
+      },
+      {
         "command": "apexDelivery.linkCurrentBranchToEpic",
         "title": "Link Current Branch To Epic",
         "icon": "$(git-branch)",
+        "category": "APEX Delivery"
+      },
+      {
+        "command": "apexDelivery.linkCurrentBranchAndOpenPinnedWorkspace",
+        "title": "Link Current Branch And Open Pinned Workspace",
+        "icon": "$(git-merge)",
         "category": "APEX Delivery"
       },
       {
@@ -390,8 +453,26 @@
         "category": "APEX Delivery"
       },
       {
+        "command": "apexDelivery.unlinkBranchFromEpic",
+        "title": "Unlink Branch From Epic",
+        "icon": "$(link-external)",
+        "category": "APEX Delivery"
+      },
+      {
+        "command": "apexDelivery.moveBranchToEpic",
+        "title": "Move Branch To Epic",
+        "icon": "$(arrow-swap)",
+        "category": "APEX Delivery"
+      },
+      {
+        "command": "apexDelivery.inspectEpicBranchBindings",
+        "title": "Inspect Epic Branch Bindings",
+        "icon": "$(list-selection)",
+        "category": "APEX Delivery"
+      },
+      {
         "command": "apexDelivery.openLinkedBranchWorktree",
-        "title": "Open Linked Branch Worktree",
+        "title": "Open Pinned Branch Workspace",
         "icon": "$(folder-opened)",
         "category": "APEX Delivery"
       },
@@ -429,6 +510,42 @@
         "command": "apexDelivery.runPhaseInCopilot",
         "title": "Run Phase with Copilot",
         "icon": "$(comment-discussion)",
+        "category": "APEX Delivery"
+      },
+      {
+        "command": "apexDelivery.explainCodeFlow",
+        "title": "Explain Code Flow",
+        "icon": "$(symbol-method)",
+        "category": "APEX Delivery"
+      },
+      {
+        "command": "apexDelivery.createTestDecision",
+        "title": "Create Test Decision",
+        "icon": "$(beaker)",
+        "category": "APEX Delivery"
+      },
+      {
+        "command": "apexDelivery.runTddSlice",
+        "title": "Run TDD Slice",
+        "icon": "$(run)",
+        "category": "APEX Delivery"
+      },
+      {
+        "command": "apexDelivery.reviewByPbi",
+        "title": "Review By PBI",
+        "icon": "$(checklist)",
+        "category": "APEX Delivery"
+      },
+      {
+        "command": "apexDelivery.generateEvidencePack",
+        "title": "Generate Evidence Pack",
+        "icon": "$(package)",
+        "category": "APEX Delivery"
+      },
+      {
+        "command": "apexDelivery.generateCopilotCliHandoff",
+        "title": "Generate Copilot CLI Handoff",
+        "icon": "$(terminal)",
         "category": "APEX Delivery"
       },
       {
@@ -500,24 +617,34 @@
           "group": "navigation@0"
         },
         {
+          "command": "apexDelivery.createPbiDelivery",
+          "when": "view == apexDeliveryView",
+          "group": "navigation@0.2"
+        },
+        {
           "command": "apexDelivery.refresh",
           "when": "view == apexDeliveryView",
           "group": "navigation@1"
         },
         {
-          "command": "apexDelivery.linkCurrentBranchToEpic",
+          "command": "apexDelivery.bindBranchToEpic",
           "when": "view == apexDeliveryView",
           "group": "navigation@1.5"
         },
         {
-          "command": "apexDelivery.linkBranchToEpic",
+          "command": "apexDelivery.manageCurrentBranchBinding",
           "when": "view == apexDeliveryView",
-          "group": "navigation@1.55"
+          "group": "navigation@1.52"
         },
         {
           "command": "apexDelivery.openLinkedBranchWorktree",
           "when": "view == apexDeliveryView",
-          "group": "navigation@1.57"
+          "group": "navigation@1.55"
+        },
+        {
+          "command": "apexDelivery.inspectEpicBranchBindings",
+          "when": "view == apexDeliveryView",
+          "group": "navigation@1.58"
         },
         {
           "command": "apexDelivery.reviewPullRequest",
@@ -557,19 +684,24 @@
           "group": "inline@0"
         },
         {
-          "command": "apexDelivery.linkCurrentBranchToEpic",
+          "command": "apexDelivery.generateCopilotCliHandoff",
+          "when": "view == apexDeliveryView && viewItem =~ /^phase/",
+          "group": "inline@0.2"
+        },
+        {
+          "command": "apexDelivery.bindBranchToEpic",
           "when": "view == apexDeliveryView && viewItem == epic",
           "group": "inline@0"
         },
         {
-          "command": "apexDelivery.linkBranchToEpic",
-          "when": "view == apexDeliveryView && viewItem == epic",
-          "group": "inline@0.5"
-        },
-        {
           "command": "apexDelivery.openLinkedBranchWorktree",
           "when": "view == apexDeliveryView && viewItem == epic",
-          "group": "inline@0.75"
+          "group": "inline@0.25"
+        },
+        {
+          "command": "apexDelivery.inspectEpicBranchBindings",
+          "when": "view == apexDeliveryView && viewItem == epic",
+          "group": "inline@0.5"
         },
         {
           "command": "apexDelivery.reviewPullRequest",
@@ -585,6 +717,31 @@
           "command": "apexDelivery.proposeArtifactUpdate",
           "when": "view == apexDeliveryView && viewItem =~ /^phase/",
           "group": "inline@3"
+        },
+        {
+          "command": "apexDelivery.explainCodeFlow",
+          "when": "view == apexDeliveryView && viewItem == epic",
+          "group": "navigation@1.1"
+        },
+        {
+          "command": "apexDelivery.createTestDecision",
+          "when": "view == apexDeliveryView && viewItem == epic",
+          "group": "navigation@1.2"
+        },
+        {
+          "command": "apexDelivery.runTddSlice",
+          "when": "view == apexDeliveryView && viewItem == epic",
+          "group": "navigation@1.3"
+        },
+        {
+          "command": "apexDelivery.reviewByPbi",
+          "when": "view == apexDeliveryView && viewItem == epic",
+          "group": "navigation@1.4"
+        },
+        {
+          "command": "apexDelivery.generateEvidencePack",
+          "when": "view == apexDeliveryView && viewItem == epic",
+          "group": "navigation@1.5"
         },
         {
           "command": "apexDelivery.advancePhase",
@@ -607,16 +764,22 @@
   "scripts": {
     "vscode:prepublish": "npm run compile",
     "compile": "tsc -p ./",
+    "lint": "tsc -p ./ --noEmit",
+    "check": "npm run lint && npm run compile",
     "watch": "tsc -watch -p ./",
     "test:smoke": "npm run compile && node ./out/test/runTest.js",
+    "format": "prettier --write \"{src,docs,templates,scripts,.github}/**/*.{ts,js,json,md,yml,yaml}\" \"*.{json,md}\"",
+    "format:check": "prettier --check \"{src,docs,templates,scripts,.github}/**/*.{ts,js,json,md,yml,yaml}\" \"*.{json,md}\"",
+    "clean:vsix": "node ./scripts/clean-vsix.js",
     "package": "vsce package",
     "publish": "vsce publish"
   },
   "devDependencies": {
     "@types/node": "^20.0.0",
-    "@vscode/test-electron": "^2.5.2",
     "@types/vscode": "^1.85.0",
+    "@vscode/test-electron": "^2.5.2",
     "@vscode/vsce": "^2.15.0",
+    "prettier": "^3.8.3",
     "typescript": "^5.3.0"
   }
 }

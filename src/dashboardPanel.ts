@@ -1,7 +1,9 @@
+import * as fs from 'fs';
 import * as path from 'path';
 import * as vscode from 'vscode';
 import { escapeHtml } from './html';
 import type { PortfolioEpicEntry, PortfolioSnapshot } from './portfolioModel';
+import { computePbiReviewScore, isPbiDeliveryWorkflow } from './pbiWorkflow';
 
 export class DashboardPanel {
   private static currentPanel: DashboardPanel | undefined;
@@ -23,7 +25,7 @@ export class DashboardPanel {
       'apexDeliveryDashboard',
       'APEX Delivery Dashboard',
       vscode.ViewColumn.One,
-      { enableScripts: false, retainContextWhenHidden: true },
+      { enableScripts: true, retainContextWhenHidden: true },
     );
     DashboardPanel.currentPanel = new DashboardPanel(panel);
     DashboardPanel.currentPanel.update(snapshot);
@@ -40,6 +42,14 @@ export class DashboardPanel {
   private render(snapshot: PortfolioSnapshot): string {
     const total = snapshot.entries.length;
     const { summary } = snapshot;
+    const pbiEntries = snapshot.entries.filter((entry) => isPbiDeliveryWorkflow(entry.epic.workflowId));
+    const reviewReadyPbis = pbiEntries.filter((entry) => computePbiReviewScore(entry.epic).score >= 80).length;
+    const staleHandoffs = pbiEntries.filter((entry) => hasStaleHandoff(entry.epic.folderPath)).length;
+    const owners = uniqueSorted(snapshot.entries.flatMap((entry) => [
+      entry.epic.coordination?.owner,
+      ...entry.epic.phases.map((phase) => phase.owner),
+    ]));
+    const statuses = uniqueSorted(snapshot.entries.flatMap((entry) => entry.epic.phases.map((phase) => phase.status)));
     const indexStateLabel = snapshot.indexState === 'available'
       ? 'Portfolio index loaded'
       : snapshot.indexState === 'invalid'
@@ -141,6 +151,47 @@ export class DashboardPanel {
     margin: 28px 0 12px;
     font-size: 16px;
     letter-spacing: -0.02em;
+  }
+  .filters {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+    gap: 12px;
+    align-items: end;
+    margin: 0 0 22px;
+    padding: 14px;
+    border: 1px solid var(--line);
+    border-radius: 8px;
+    background: rgba(255,255,255,0.03);
+  }
+  .field label, .toggle {
+    display: block;
+    color: var(--muted);
+    font-size: 12px;
+    margin-bottom: 6px;
+  }
+  select {
+    width: 100%;
+    color: var(--vscode-input-foreground);
+    background: var(--vscode-input-background);
+    border: 1px solid var(--vscode-input-border, var(--line));
+    border-radius: 4px;
+    padding: 7px 8px;
+  }
+  .toggles {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 10px 14px;
+  }
+  .toggle {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    margin: 0;
+  }
+  .filter-count {
+    color: var(--muted);
+    font-size: 12px;
+    align-self: center;
   }
   .warning-list {
     display: grid;
@@ -282,6 +333,7 @@ export class DashboardPanel {
     color: var(--muted);
     background: linear-gradient(180deg, rgba(15, 118, 110, 0.10), rgba(15, 23, 42, 0.08));
   }
+  .hidden { display: none; }
   @media (max-width: 760px) {
     body { padding: 20px; }
     .hero { flex-direction: column; align-items: stretch; }
@@ -306,6 +358,8 @@ export class DashboardPanel {
     <section class="stats">
       <div class="stat"><strong>${total}</strong><span>Total epics</span></div>
       <div class="stat"><strong>${summary.activeEpics}</strong><span>Active now</span></div>
+      <div class="stat"><strong>${pbiEntries.length}</strong><span>Daily PBIs</span></div>
+      <div class="stat"><strong>${reviewReadyPbis}</strong><span>Review-ready PBIs</span></div>
       <div class="stat"><strong>${summary.openPullRequests}</strong><span>Linked PRs</span></div>
       <div class="stat"><strong>${summary.localWorktrees}</strong><span>Observed worktrees</span></div>
       <div class="stat"><strong>${summary.missingBranchLinks}</strong><span>Missing branch links</span></div>
@@ -318,15 +372,79 @@ export class DashboardPanel {
       <div class="inbox-card"><strong>${summary.readyForRelease}</strong><span>Ready for release</span></div>
       <div class="inbox-card"><strong>${summary.missingBranchLinks}</strong><span>Need branch mapping</span></div>
     </section>
+    ${pbiEntries.length > 0 ? `<h2 class="section-title">Daily Work</h2><section class="inbox"><div class="inbox-card"><strong>${pbiEntries.length}</strong><span>Active PBI workflows</span></div><div class="inbox-card"><strong>${reviewReadyPbis}</strong><span>Review-ready</span></div><div class="inbox-card"><strong>${staleHandoffs}</strong><span>Stale CLI handoffs</span></div><div class="inbox-card"><strong>${pbiEntries.filter((entry) => entry.epic.hasBlocked).length}</strong><span>Blocked PBIs</span></div></section>` : ''}
     ${snapshot.warnings.length > 0 ? `<h2 class="section-title">Warnings</h2><section class="warning-list">${snapshot.warnings.map(renderWarning).join('')}</section>` : ''}
     <h2 class="section-title">Portfolio Lanes</h2>
+    <section class="filters" aria-label="Dashboard filters">
+      <div class="field">
+        <label for="ownerFilter">Owner</label>
+        <select id="ownerFilter">
+          <option value="">All owners</option>
+          ${owners.map((owner) => `<option value="${escapeHtml(owner)}">${escapeHtml(owner)}</option>`).join('')}
+        </select>
+      </div>
+      <div class="field">
+        <label for="statusFilter">Phase status</label>
+        <select id="statusFilter">
+          <option value="">All statuses</option>
+          ${statuses.map((status) => `<option value="${escapeHtml(status)}">${escapeHtml(status)}</option>`).join('')}
+        </select>
+      </div>
+      <div class="toggles">
+        <label class="toggle"><input id="blockedFilter" type="checkbox">Blocked</label>
+        <label class="toggle"><input id="reviewFilter" type="checkbox">Awaiting review</label>
+        <label class="toggle"><input id="openPrFilter" type="checkbox">Open PR</label>
+        <label class="toggle"><input id="staleFilter" type="checkbox">Stale</label>
+      </div>
+      <div id="filterCount" class="filter-count"></div>
+    </section>
     <section class="epic-list">
       ${snapshot.entries.length === 0 ? '<div class="empty">No epics found yet. Create a sample epic from the tree view to see the full APEX workflow.</div>' : snapshot.entries.map(renderEpicEntry).join('')}
     </section>
   </main>
+  <script>
+    const controls = {
+      owner: document.getElementById('ownerFilter'),
+      status: document.getElementById('statusFilter'),
+      blocked: document.getElementById('blockedFilter'),
+      review: document.getElementById('reviewFilter'),
+      openPr: document.getElementById('openPrFilter'),
+      stale: document.getElementById('staleFilter'),
+      count: document.getElementById('filterCount'),
+    };
+    const cards = Array.from(document.querySelectorAll('[data-epic-card]'));
+    function applyFilters() {
+      let visible = 0;
+      for (const card of cards) {
+        const ownerMatch = !controls.owner.value || card.dataset.owners.split('|').includes(controls.owner.value);
+        const statusMatch = !controls.status.value || card.dataset.statuses.split('|').includes(controls.status.value);
+        const blockedMatch = !controls.blocked.checked || card.dataset.blocked === 'true';
+        const reviewMatch = !controls.review.checked || card.dataset.review === 'true';
+        const openPrMatch = !controls.openPr.checked || card.dataset.openPr === 'true';
+        const staleMatch = !controls.stale.checked || card.dataset.stale === 'true';
+        const matches = ownerMatch && statusMatch && blockedMatch && reviewMatch && openPrMatch && staleMatch;
+        card.classList.toggle('hidden', !matches);
+        if (matches) {
+          visible += 1;
+        }
+      }
+      controls.count.textContent = visible + ' of ' + cards.length + ' epics shown';
+    }
+    Object.values(controls).forEach((control) => {
+      if (control && control !== controls.count) {
+        control.addEventListener('change', applyFilters);
+      }
+    });
+    applyFilters();
+  </script>
 </body>
 </html>`;
   }
+}
+
+function uniqueSorted(values: readonly (string | undefined)[]): string[] {
+  return [...new Set(values.filter((value): value is string => typeof value === 'string' && value.trim().length > 0))]
+    .sort((left, right) => left.localeCompare(right));
 }
 
 function renderWarning(warning: string): string {
@@ -336,12 +454,23 @@ function renderWarning(warning: string): string {
 function renderEpicEntry(entry: PortfolioEpicEntry): string {
   const { epic } = entry;
   const currentPhase = epic.phases[epic.currentPhaseIndex];
+  const owners = uniqueSorted([
+    epic.coordination?.owner,
+    ...epic.phases.map((phase) => phase.owner),
+  ]);
+  const statuses = uniqueSorted(epic.phases.map((phase) => phase.status));
+  const hasStaleSignal = epic.phases.some((phase) => phase.status === 'stale') || hasStalePullRequestSignal(entry);
+  const reviewScore = isPbiDeliveryWorkflow(epic.workflowId) ? computePbiReviewScore(epic) : undefined;
+  const blockedAge = formatBlockedAge(epic);
+  const staleCli = hasStaleHandoff(epic.folderPath);
   const badges = [
     `<span class="badge progress">${epic.progress}% complete</span>`,
     currentPhase ? `<span class="badge progress">Now: ${escapeHtml(currentPhase.name)}</span>` : '<span class="badge progress">Workflow complete</span>',
     epic.hasAwaitingReview ? '<span class="badge review">Needs review</span>' : '',
     epic.hasBlocked ? '<span class="badge blocked">Blocked</span>' : '',
     entry.worktreeSignal ? '<span class="badge signal">Worktree observed</span>' : '',
+    reviewScore ? `<span class="badge signal">Review ${reviewScore.score}/100</span>` : '',
+    staleCli ? '<span class="badge blocked">Stale handoff</span>' : '',
   ].filter((badge) => badge.length > 0).join('');
 
   const details = [
@@ -351,6 +480,8 @@ function renderEpicEntry(entry: PortfolioEpicEntry): string {
     epic.coordination?.coordinationStatus ? `Coordination: ${escapeHtml(epic.coordination.coordinationStatus)}` : undefined,
     entry.linkedBranchNames.length > 0 ? `Branches: ${entry.linkedBranchNames.map((branch) => escapeHtml(branch)).join(', ')}` : 'Branches: Not linked yet',
     `Linked PRs: ${entry.pullRequestCount}`,
+    reviewScore ? `Review readiness: ${reviewScore.readiness}` : undefined,
+    blockedAge ? `Blocked age: ${escapeHtml(blockedAge)}` : undefined,
   ].filter((line): line is string => Boolean(line)).join(' · ');
 
   const signalLines = entry.worktreeSignal
@@ -365,7 +496,7 @@ function renderEpicEntry(entry: PortfolioEpicEntry): string {
       ].filter((line): line is string => Boolean(line))
     : ['No local worktree observed for the linked branches.'];
 
-  return `<article class="epic">
+  return `<article class="epic" data-epic-card data-owners="${escapeHtml(owners.join('|'))}" data-statuses="${escapeHtml(statuses.join('|'))}" data-blocked="${epic.hasBlocked ? 'true' : 'false'}" data-review="${epic.hasAwaitingReview ? 'true' : 'false'}" data-open-pr="${entry.pullRequestCount > 0 ? 'true' : 'false'}" data-stale="${hasStaleSignal ? 'true' : 'false'}">
     <div class="epic-head">
       <div>
         <div class="epic-title"><span class="epic-key">${escapeHtml(epic.key)}</span> ${escapeHtml(epic.title)}</div>
@@ -378,6 +509,53 @@ function renderEpicEntry(entry: PortfolioEpicEntry): string {
     <div class="signal-list">${signalLines.join(' · ')}</div>
     <div class="phases">${epic.phases.map(renderPhase).join('')}</div>
   </article>`;
+}
+
+function formatBlockedAge(epic: PortfolioEpicEntry['epic']): string | undefined {
+  const blockedPhase = epic.phases.find((phase) => phase.status === 'blocked' || phase.status === 'rejected');
+  if (!blockedPhase?.updatedAt) {
+    return undefined;
+  }
+
+  const blockedAt = new Date(blockedPhase.updatedAt).getTime();
+  if (Number.isNaN(blockedAt)) {
+    return undefined;
+  }
+
+  const ageDays = Math.floor((Date.now() - blockedAt) / (24 * 60 * 60 * 1000));
+  return `${ageDays}d`;
+}
+
+function hasStaleHandoff(epicFolderPath: string): boolean {
+  const handoffDir = path.join(epicFolderPath, 'handoffs', 'copilot-cli');
+  if (!fs.existsSync(handoffDir)) {
+    return false;
+  }
+
+  const files = fs.readdirSync(handoffDir, { withFileTypes: true })
+    .filter((entry) => entry.isFile() && entry.name.toLowerCase().endsWith('.md'))
+    .map((entry) => path.join(handoffDir, entry.name));
+  if (files.length === 0) {
+    return false;
+  }
+
+  const newestMtime = Math.max(...files.map((filePath) => fs.statSync(filePath).mtimeMs));
+  const twoDaysMs = 2 * 24 * 60 * 60 * 1000;
+  return Date.now() - newestMtime > twoDaysMs;
+}
+
+function hasStalePullRequestSignal(entry: PortfolioEpicEntry): boolean {
+  if (entry.pullRequestCount === 0 || !entry.worktreeSignal?.lastCommitAt) {
+    return false;
+  }
+
+  const lastCommitTime = new Date(entry.worktreeSignal.lastCommitAt).getTime();
+  if (Number.isNaN(lastCommitTime)) {
+    return false;
+  }
+
+  const sevenDaysMs = 7 * 24 * 60 * 60 * 1000;
+  return Date.now() - lastCommitTime > sevenDaysMs;
 }
 
 function renderPhase(phase: { name: string; owner: string; status: string }): string {

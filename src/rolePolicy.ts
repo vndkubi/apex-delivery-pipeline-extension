@@ -4,6 +4,7 @@ export interface RunPreferenceFields {
   modelFamily?: string;
   preferredChatAgent?: string;
   starterPrompt?: string;
+  starterPromptPlacement?: 'prepend' | 'append' | 'replace';
 }
 
 export interface RolePolicyResolution {
@@ -92,6 +93,10 @@ function parseRolePolicyOverride(rawOverride: unknown): RunPreferenceFields {
   const starterPrompt = normalizeNonEmptyString(rawOverride.starterPrompt);
   if (starterPrompt) {
     override.starterPrompt = starterPrompt;
+  }
+
+  if (rawOverride.starterPromptPlacement === 'prepend' || rawOverride.starterPromptPlacement === 'append' || rawOverride.starterPromptPlacement === 'replace') {
+    override.starterPromptPlacement = rawOverride.starterPromptPlacement;
   }
 
   return override;

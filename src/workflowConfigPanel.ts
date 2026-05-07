@@ -3,6 +3,7 @@ import * as vscode from 'vscode';
 import { parseWorkflowDefinitions } from './workflowModel';
 import {
   buildWorkflowEditorDraft,
+  buildWorkflowPresetDrafts,
   createEmptyPhaseDraft,
   createEmptyWorkflowDraft,
   listBundledTemplateRefs,
@@ -11,6 +12,13 @@ import {
   type WorkflowEditorValidationIssue,
   type WorkflowEditorDraft,
 } from './workflowConfigModel';
+import {
+  buildPhasePromptSurfaces,
+  normalizeStarterPromptPlacement,
+  resolvePhaseRunPlan,
+  type PhaseRunPreferenceSources,
+  type PhaseRunPreferences,
+} from './phaseRunPlan';
 import { ensureWorkspaceTextRefFile } from './workspaceTextRef';
 
 interface WorkflowConfigPanelOptions {
@@ -21,10 +29,26 @@ interface WorkflowConfigPanelOptions {
 }
 
 interface WorkflowConfigMessage {
-  type: 'save' | 'reload' | 'pickWorkspaceTemplate';
+  type: 'save' | 'reload' | 'pickWorkspaceTemplate' | 'preview';
   draft?: WorkflowEditorDraft;
   workflowIndex?: number;
   phaseIndex?: number;
+}
+
+interface WorkflowRuntimePreview {
+  provider: string;
+  roleLabel: string;
+  autoSubmitLabel: string;
+  preferredChatAgent?: string;
+  agentTag?: string;
+  starterPromptPlacement: string;
+  promptSurfaces: {
+    scopedChat: string;
+    agent: string;
+    cli: string;
+  };
+  defaultSurface: 'scopedChat' | 'agent' | 'cli';
+  sources: PhaseRunPreferenceSources;
 }
 
 export class WorkflowConfigPanel {
@@ -68,6 +92,12 @@ export class WorkflowConfigPanel {
     switch (message.type) {
       case 'reload':
         await this.postState('Reloaded workspace workflow configuration.');
+        return;
+      case 'preview':
+        if (!message.draft) {
+          return;
+        }
+        await this.postPreviewState(message.draft);
         return;
       case 'pickWorkspaceTemplate':
         await this.pickWorkspaceTemplate(message.workflowIndex, message.phaseIndex);
@@ -153,14 +183,23 @@ export class WorkflowConfigPanel {
 
   private update(): void {
     const draft = this.readDraft();
-    this.panel.webview.html = buildWorkflowConfigPanelHtml(this.panel.webview, draft, this.bundledTemplates);
+    this.panel.webview.html = buildWorkflowConfigPanelHtml(this.panel.webview, draft, this.bundledTemplates, this.options.workspaceRoot);
   }
 
   private async postState(message: string): Promise<void> {
+    const draft = this.readDraft();
     await this.panel.webview.postMessage({
       type: 'state',
-      draft: this.readDraft(),
+      draft,
+      runtimePreviews: buildWorkflowRuntimePreviews(draft, this.options.workspaceRoot),
       message,
+    });
+  }
+
+  private async postPreviewState(draft: WorkflowEditorDraft): Promise<void> {
+    await this.panel.webview.postMessage({
+      type: 'previewState',
+      runtimePreviews: buildWorkflowRuntimePreviews(draft, this.options.workspaceRoot),
     });
   }
 
@@ -179,11 +218,16 @@ export function buildWorkflowConfigPanelHtml(
   webview: Pick<vscode.Webview, 'cspSource'>,
   draft: WorkflowEditorDraft,
   bundledTemplates: readonly string[],
+  workspaceRoot: string,
 ): string {
   const nonce = createNonce();
   const initialState = JSON.stringify({
     draft,
     bundledTemplates,
+    presetWorkflows: buildWorkflowPresetDrafts(),
+    rolePresets: ['BA', 'Tech Lead', 'Developer', 'Reviewer', 'QA', 'Release Manager'],
+    runtimeContext: buildRuntimePreviewContext(),
+    runtimePreviews: buildWorkflowRuntimePreviews(draft, workspaceRoot),
     factory: {
       createEmptyWorkflowDraft: createEmptyWorkflowDraft(0),
       createEmptyPhaseDraft: createEmptyPhaseDraft(0),
@@ -283,6 +327,14 @@ export function buildWorkflowConfigPanelHtml(
     background: rgba(225, 29, 72, 0.14);
     color: #fecdd3;
     border-color: rgba(251, 113, 133, 0.28);
+  }
+  button.preview-surface {
+    padding: 8px 12px;
+  }
+  button.preview-surface.is-active {
+    background: color-mix(in srgb, var(--vscode-button-background) 72%, #38bdf8 28%);
+    border-color: rgba(56, 189, 248, 0.45);
+    color: var(--vscode-button-foreground);
   }
   button:disabled {
     cursor: not-allowed;
@@ -437,6 +489,7 @@ export function buildWorkflowConfigPanelHtml(
     <section class="toolbar">
       <div class="toolbar-left">
         <button type="button" class="secondary" data-action="add-workflow">Add Workflow</button>
+        <button type="button" class="secondary" data-action="add-pbi-preset">Add PBI Delivery Preset</button>
         <button type="button" class="ghost" data-action="reload">Reload From Settings</button>
       </div>
       <div class="toolbar-right">
@@ -446,13 +499,18 @@ export function buildWorkflowConfigPanelHtml(
     </section>
     <div id="status" class="status" role="status" aria-live="polite"></div>
     <section id="app"></section>
+    <datalist id="rolePresetList">
+      ${['BA', 'Tech Lead', 'Developer', 'Reviewer', 'QA', 'Release Manager'].map((role) => `<option value="${role}"></option>`).join('')}
+    </datalist>
   </main>
   <script nonce="${nonce}">
     const vscode = acquireVsCodeApi();
     const initial = ${initialState};
     let draft = deepClone(initial.draft);
     let bundledTemplates = [...initial.bundledTemplates];
+    let runtimePreviews = deepClone(initial.runtimePreviews || {});
     let hostIssues = [];
+    let previewUpdateTimer;
 
     document.body.addEventListener('click', onClick);
     document.body.addEventListener('input', onFieldChange);
@@ -469,9 +527,16 @@ export function buildWorkflowConfigPanelHtml(
 
       if (message.type === 'state' && message.draft) {
         draft = deepClone(message.draft);
+        runtimePreviews = deepClone(message.runtimePreviews || {});
         hostIssues = [];
         setStatus(message.message, 'success');
         render();
+        return;
+      }
+
+      if (message.type === 'previewState') {
+        runtimePreviews = deepClone(message.runtimePreviews || {});
+        paintRuntimePreviews();
         return;
       }
 
@@ -496,6 +561,7 @@ export function buildWorkflowConfigPanelHtml(
         phase.templateRef = message.templateRef || '';
         hostIssues = [];
         render();
+        schedulePreviewUpdate();
       }
     }
 
@@ -513,8 +579,30 @@ export function buildWorkflowConfigPanelHtml(
       const workflowIndex = toNumber(target.dataset.workflowIndex);
       const phaseIndex = toNumber(target.dataset.phaseIndex);
 
+      if (action === 'set-preview-surface') {
+        const container = target.closest('[data-preview-key]');
+        if (container instanceof HTMLElement && target.dataset.surface) {
+          container.dataset.previewSurface = target.dataset.surface;
+          paintRuntimePreviews();
+        }
+        return;
+      }
+
       if (action === 'add-workflow') {
         draft.workflows.push(createWorkflowDraft(draft.workflows.length));
+        hostIssues = [];
+        render();
+        return;
+      }
+
+      if (action === 'add-pbi-preset') {
+        const preset = deepClone(initial.presetWorkflows[0]);
+        if (!preset) {
+          return;
+        }
+        preset.id = uniqueWorkflowId(preset.id);
+        preset.name = uniqueWorkflowName(preset.name);
+        draft.workflows.push(preset);
         hostIssues = [];
         render();
         return;
@@ -543,8 +631,21 @@ export function buildWorkflowConfigPanelHtml(
         return;
       }
 
+      const workflow = draft.workflows[workflowIndex];
+      if (!workflow) {
+        return;
+      }
+
       if (action === 'remove-workflow') {
         draft.workflows.splice(workflowIndex, 1);
+        hostIssues = [];
+        render();
+        return;
+      }
+
+      if (action === 'duplicate-workflow') {
+        const duplicated = duplicateWorkflow(workflow, workflowIndex);
+        draft.workflows.splice(workflowIndex + 1, 0, duplicated);
         hostIssues = [];
         render();
         return;
@@ -561,11 +662,6 @@ export function buildWorkflowConfigPanelHtml(
         swap(draft.workflows, workflowIndex, workflowIndex + 1);
         hostIssues = [];
         render();
-        return;
-      }
-
-      const workflow = draft.workflows[workflowIndex];
-      if (!workflow) {
         return;
       }
 
@@ -630,7 +726,12 @@ export function buildWorkflowConfigPanelHtml(
       }
 
       if (scope === 'workflow') {
-        workflow[field] = target.value;
+        if (field.startsWith('execution.')) {
+          setNestedValue(workflow, field, target.value);
+          workflow.execution.configured = true;
+        } else {
+          workflow[field] = target.value;
+        }
         hostIssues = [];
         paintValidation();
         return;
@@ -667,6 +768,13 @@ export function buildWorkflowConfigPanelHtml(
         return;
       }
 
+      if (field === 'enabled') {
+        phase.enabled = target.checked;
+        hostIssues = [];
+        paintValidation();
+        return;
+      }
+
       if (field.startsWith('sessionDefaults.')) {
         const key = field.replace('sessionDefaults.', '');
         phase.sessionDefaults[key] = target.value;
@@ -676,6 +784,82 @@ export function buildWorkflowConfigPanelHtml(
 
       hostIssues = [];
       paintValidation();
+      schedulePreviewUpdate();
+    }
+
+    function previewKey(workflowIndex, phaseIndex) {
+      return workflowIndex + ':' + phaseIndex;
+    }
+
+    function schedulePreviewUpdate() {
+      window.clearTimeout(previewUpdateTimer);
+      previewUpdateTimer = window.setTimeout(() => {
+        vscode.postMessage({ type: 'preview', draft });
+      }, 160);
+    }
+
+    function paintRuntimePreviews() {
+      const previewSections = document.querySelectorAll('[data-preview-key]');
+      previewSections.forEach((section) => {
+        if (!(section instanceof HTMLElement)) {
+          return;
+        }
+
+        const key = section.dataset.previewKey;
+        if (!key) {
+          return;
+        }
+
+        const preview = runtimePreviews[key];
+        if (!preview) {
+          const previewField = section.querySelector('[data-preview-field="promptPreview"]');
+          if (previewField instanceof HTMLTextAreaElement) {
+            previewField.value = 'Preview unavailable for this phase.';
+          }
+          return;
+        }
+
+        const activeSurface = section.dataset.previewSurface || preview.defaultSurface || 'scopedChat';
+        section.dataset.previewSurface = activeSurface;
+
+        const promptPreviewField = section.querySelector('[data-preview-field="promptPreview"]');
+        if (promptPreviewField instanceof HTMLTextAreaElement) {
+          promptPreviewField.value = preview.promptSurfaces[activeSurface] || '';
+        }
+
+        setPreviewField(section, 'provider', preview.provider || 'vscodeBuiltIn');
+        setPreviewField(section, 'roleLabel', preview.roleLabel || 'not configured');
+        setPreviewField(section, 'autoSubmitLabel', preview.autoSubmitLabel || 'false');
+        setPreviewField(section, 'preferredChatAgent', preview.preferredChatAgent || 'none');
+        setPreviewField(section, 'agentTag', preview.agentTag || 'none');
+        setPreviewField(section, 'starterPromptPlacement', preview.starterPromptPlacement || 'prepend');
+        setPreviewField(section, 'sourceSummary', formatPreviewSources(preview.sources));
+
+        section.querySelectorAll('[data-action="set-preview-surface"]').forEach((button) => {
+          if (!(button instanceof HTMLElement)) {
+            return;
+          }
+          button.classList.toggle('is-active', button.dataset.surface === activeSurface);
+        });
+      });
+    }
+
+    function setPreviewField(section, field, value) {
+      section.querySelectorAll('[data-preview-field="' + field + '"]').forEach((element) => {
+        element.textContent = value;
+      });
+    }
+
+    function formatPreviewSources(sources) {
+      if (!sources || typeof sources !== 'object') {
+        return 'unavailable';
+      }
+      return [
+        'starterPrompt=' + (sources.starterPrompt || 'n/a'),
+        'placement=' + (sources.starterPromptPlacement || 'n/a'),
+        'agent=' + (sources.preferredChatAgent || 'n/a'),
+        'autoSubmit=' + (sources.autoSubmit || 'n/a'),
+      ].join(' | ');
     }
 
     function render() {
@@ -691,8 +875,10 @@ export function buildWorkflowConfigPanelHtml(
       }
 
       paintValidation();
+      paintRuntimePreviews();
       updateSummary();
-      vscode.setState({ draft, bundledTemplates });
+      vscode.setState({ draft, bundledTemplates, runtimePreviews });
+      schedulePreviewUpdate();
     }
 
     function renderWorkflow(workflow, workflowIndex) {
@@ -704,6 +890,7 @@ export function buildWorkflowConfigPanelHtml(
               '<p>Workspace-scoped flow used when creating new epics. Order is preserved exactly as shown.</p>' +
             '</div>' +
             '<div class="workflow-actions">' +
+              actionButton('Duplicate', 'duplicate-workflow', workflowIndex, undefined, 'secondary') +
               actionButton('Move Up', 'move-workflow-up', workflowIndex, undefined, 'ghost') +
               actionButton('Move Down', 'move-workflow-down', workflowIndex, undefined, 'ghost') +
               actionButton('Remove Workflow', 'remove-workflow', workflowIndex, undefined, 'danger') +
@@ -713,10 +900,23 @@ export function buildWorkflowConfigPanelHtml(
             renderField('Workflow Id', workflow.id, 'workflow', workflowIndex, undefined, 'id') +
             renderField('Workflow Name', workflow.name, 'workflow', workflowIndex, undefined, 'name') +
           '</div>' +
+          '<div class="section-title">Execution Policy</div>' +
+          renderExecutionPolicy(workflow, workflowIndex) +
           '<div class="section-title">Phases</div>' +
           '<div class="phase-list">' + workflow.phases.map((phase, phaseIndex) => renderPhase(workflowIndex, phaseIndex, phase)).join('') + '</div>' +
           '<div style="margin-top: 14px;">' + actionButton('Add Phase', 'add-phase', workflowIndex, undefined, 'secondary') + '</div>' +
         '</article>';
+    }
+
+    function renderExecutionPolicy(workflow, workflowIndex) {
+      return '' +
+        '<div class="field-grid">' +
+          renderSelect('Default Execution', workflow.execution.mode, ['control', 'pooled', 'pinned'], workflowIndex, undefined, 'execution.mode', ['Control Workspace', 'Managed Pool', 'Pinned Workspace']) +
+          renderSelect('Run Phase Execution', workflow.execution.commands.runPhase, ['control', 'pooled', 'pinned'], workflowIndex, undefined, 'execution.commands.runPhase', ['Control Workspace', 'Managed Pool', 'Pinned Workspace']) +
+          renderSelect('Review Pull Request Execution', workflow.execution.commands.reviewPullRequest, ['control', 'pooled', 'pinned'], workflowIndex, undefined, 'execution.commands.reviewPullRequest', ['Control Workspace', 'Managed Pool', 'Pinned Workspace']) +
+          renderSelect('Open Workspace Execution', workflow.execution.commands.openWorkspace, ['control', 'pooled', 'pinned'], workflowIndex, undefined, 'execution.commands.openWorkspace', ['Control Workspace', 'Managed Pool', 'Pinned Workspace']) +
+        '</div>' +
+        '<div class="hint">Execution policy is snapshotted into new epics. This phase stores workflow policy only; pooled auto-routing is not enabled yet.</div>';
     }
 
     function renderPhase(workflowIndex, phaseIndex, phase) {
@@ -741,8 +941,11 @@ export function buildWorkflowConfigPanelHtml(
           '<div class="field-grid">' +
             renderField('Phase Id', phase.id, 'phase', workflowIndex, phaseIndex, 'id') +
             renderField('Phase Name', phase.name, 'phase', workflowIndex, phaseIndex, 'name') +
-            renderField('Owner', phase.owner, 'phase', workflowIndex, phaseIndex, 'owner') +
+            renderOwnerField('Owner', phase.owner, workflowIndex, phaseIndex, 'owner') +
             renderField('Artifact Filename', phase.artifact, 'phase', workflowIndex, phaseIndex, 'artifact') +
+          '</div>' +
+          '<div class="field-grid">' +
+            renderCheckbox('Enabled', phase.enabled !== false, workflowIndex, phaseIndex, 'enabled', 'Disabled phases stay in the workflow config but are skipped when new epics are created.') +
           '</div>' +
           '<div class="field-grid full">' +
             renderTextSourceEditor('Output Summary', phase.outputMode, phase.output, phase.outputRef, workflowIndex, phaseIndex, 'output', 'outputMode', 'outputRef', true) +
@@ -753,17 +956,44 @@ export function buildWorkflowConfigPanelHtml(
           '</div>' +
           templateControl +
           '<div class="section-title">Run Defaults</div>' +
-          '<div class="field-grid">' +
-            renderSelect('Auto Submit', phase.sessionDefaults.autoSubmit, ['inherit', 'true', 'false'], workflowIndex, phaseIndex, 'sessionDefaults.autoSubmit', ['Inherit Workspace Default', 'Always Auto-Submit', 'Always Prefill Only']) +
-            renderField('Preferred Chat Agent', phase.sessionDefaults.preferredChatAgent, 'phase', workflowIndex, phaseIndex, 'sessionDefaults.preferredChatAgent') +
-            renderField('Model Family', phase.sessionDefaults.modelFamily, 'phase', workflowIndex, phaseIndex, 'sessionDefaults.modelFamily') +
-            renderField('Agent Tag', phase.sessionDefaults.agentTag, 'phase', workflowIndex, phaseIndex, 'sessionDefaults.agentTag') +
-          '</div>' +
           '<div class="field-grid full">' +
             renderTextSourceEditor('Starter Prompt', phase.sessionDefaults.starterPromptMode, phase.sessionDefaults.starterPrompt, phase.sessionDefaults.starterPromptRef, workflowIndex, phaseIndex, 'sessionDefaults.starterPrompt', 'sessionDefaults.starterPromptMode', 'sessionDefaults.starterPromptRef', false) +
           '</div>' +
+          '<div class="field-grid">' +
+            renderSelect('Starter Prompt Placement', phase.sessionDefaults.starterPromptPlacement, ['prepend', 'append', 'replace'], workflowIndex, phaseIndex, 'sessionDefaults.starterPromptPlacement', ['Prepend To Base Prompt', 'Append To Base Prompt', 'Replace Base Prompt']) +
+            renderSelect('Auto Submit', phase.sessionDefaults.autoSubmit, ['inherit', 'true', 'false'], workflowIndex, phaseIndex, 'sessionDefaults.autoSubmit', ['Inherit Workspace Default', 'Always Auto-Submit', 'Always Prefill Only']) +
+            renderField('Preferred Chat Agent', phase.sessionDefaults.preferredChatAgent, 'phase', workflowIndex, phaseIndex, 'sessionDefaults.preferredChatAgent') +
+            renderField('Agent Tag', phase.sessionDefaults.agentTag, 'phase', workflowIndex, phaseIndex, 'sessionDefaults.agentTag') +
+          '</div>' +
+          '<div class="section-title">Effective Run Preview</div>' +
+          renderRunPreview(workflowIndex, phaseIndex) +
           autopilotNote +
         '</section>';
+    }
+
+    function renderRunPreview(workflowIndex, phaseIndex) {
+      const key = previewKey(workflowIndex, phaseIndex);
+      return '<div class="field full-span preview-card" data-preview-key="' + key + '">' +
+        '<div class="hint">Support: Starter Prompt <strong>Active</strong> · Auto Submit <strong>Active</strong> · Preferred Chat Agent <strong>Best effort</strong> · Execution Policy <strong>Preview / Guardrail</strong></div>' +
+        '<div class="field-grid" style="margin-top: 8px;">' +
+          '<div class="workflow-actions">' +
+            previewSurfaceButton('Built-in Chat', 'scopedChat', workflowIndex, phaseIndex) +
+            previewSurfaceButton('Attached Agent', 'agent', workflowIndex, phaseIndex) +
+            previewSurfaceButton('CLI Handoff', 'cli', workflowIndex, phaseIndex) +
+          '</div>' +
+        '</div>' +
+        '<div class="hero-note" style="min-width: 0; margin-top: 8px;">' +
+          '<strong>Effective Runtime</strong>' +
+          '<div>Provider: <code data-preview-field="provider"></code></div>' +
+          '<div>Role: <code data-preview-field="roleLabel"></code></div>' +
+          '<div>Auto submit: <code data-preview-field="autoSubmitLabel"></code></div>' +
+          '<div>Agent hint: <code data-preview-field="preferredChatAgent"></code></div>' +
+          '<div>Agent tag: <code data-preview-field="agentTag"></code></div>' +
+          '<div>Starter prompt placement: <code data-preview-field="starterPromptPlacement"></code></div>' +
+          '<div>Resolved from: <code data-preview-field="sourceSummary"></code></div>' +
+        '</div>' +
+        '<textarea readonly style="margin-top: 10px; min-height: 220px;" data-preview-field="promptPreview"></textarea>' +
+      '</div>';
     }
 
     function renderTemplateControl(workflowIndex, phaseIndex, phase) {
@@ -795,6 +1025,26 @@ export function buildWorkflowConfigPanelHtml(
       return '<div class="field">' +
         '<label>' + escapeHtml(label) + '</label>' +
         '<input data-scope="' + scope + '" data-workflow-index="' + workflowIndex + '"' + attributePhaseIndex(phaseIndex) + ' data-field="' + field + '" value="' + escapeHtml(value || '') + '">' +
+        '<div class="error" data-error-for="' + fieldPath(workflowIndex, phaseIndex, field) + '"></div>' +
+      '</div>';
+    }
+
+    function renderOwnerField(label, value, workflowIndex, phaseIndex, field) {
+      return '<div class="field">' +
+        '<label>' + escapeHtml(label) + '</label>' +
+        '<input list="rolePresetList" data-scope="phase" data-workflow-index="' + workflowIndex + '" data-phase-index="' + phaseIndex + '" data-field="' + field + '" value="' + escapeHtml(value || '') + '">' +
+        '<div class="hint">Suggested role presets: ' + escapeHtml(initial.rolePresets.join(', ')) + '</div>' +
+        '<div class="error" data-error-for="' + fieldPath(workflowIndex, phaseIndex, field) + '"></div>' +
+      '</div>';
+    }
+
+    function renderCheckbox(label, checked, workflowIndex, phaseIndex, field, hint) {
+      return '<div class="field full-span">' +
+        '<label>' + escapeHtml(label) + '</label>' +
+        '<label class="toggle">' +
+          '<input type="checkbox" data-scope="phase" data-workflow-index="' + workflowIndex + '" data-phase-index="' + phaseIndex + '" data-field="' + field + '"' + (checked ? ' checked' : '') + '>' +
+          escapeHtml(hint) +
+        '</label>' +
         '<div class="error" data-error-for="' + fieldPath(workflowIndex, phaseIndex, field) + '"></div>' +
       '</div>';
     }
@@ -926,9 +1176,25 @@ export function buildWorkflowConfigPanelHtml(
           issues.push({ path: 'workflow.' + workflowIndex + '.name', message: 'Workflow name is required.' });
         }
 
+        if (!isValidExecutionMode(workflow.execution?.mode)) {
+          issues.push({ path: 'workflow.' + workflowIndex + '.execution.mode', message: 'Default execution must be control, pooled, or pinned.' });
+        }
+        if (!isValidExecutionMode(workflow.execution?.commands?.runPhase)) {
+          issues.push({ path: 'workflow.' + workflowIndex + '.execution.commands.runPhase', message: 'Run Phase execution must be control, pooled, or pinned.' });
+        }
+        if (!isValidExecutionMode(workflow.execution?.commands?.reviewPullRequest)) {
+          issues.push({ path: 'workflow.' + workflowIndex + '.execution.commands.reviewPullRequest', message: 'Review Pull Request execution must be control, pooled, or pinned.' });
+        }
+        if (!isValidExecutionMode(workflow.execution?.commands?.openWorkspace)) {
+          issues.push({ path: 'workflow.' + workflowIndex + '.execution.commands.openWorkspace', message: 'Open Workspace execution must be control, pooled, or pinned.' });
+        }
+
         if (!Array.isArray(workflow.phases) || workflow.phases.length === 0) {
           issues.push({ path: 'workflow.' + workflowIndex + '.phases', message: 'At least one phase is required.' });
           return;
+        }
+        if (!workflow.phases.some((phase) => phase.enabled !== false)) {
+          issues.push({ path: 'workflow.' + workflowIndex + '.phases', message: 'At least one enabled phase is required.' });
         }
 
         const phaseIds = new Set();
@@ -945,6 +1211,9 @@ export function buildWorkflowConfigPanelHtml(
 
           if (!normalize(phase.name)) {
             issues.push({ path: prefix + '.name', message: 'Phase name is required.' });
+          }
+          if (phase.enabled === false) {
+            return;
           }
           if (!normalize(phase.owner)) {
             issues.push({ path: prefix + '.owner', message: 'Owner is required.' });
@@ -1012,6 +1281,17 @@ export function buildWorkflowConfigPanelHtml(
       return next;
     }
 
+    function previewSurfaceButton(label, surface, workflowIndex, phaseIndex) {
+      return '<button type="button" class="action secondary preview-surface" data-action="set-preview-surface" data-surface="' + surface + '" data-workflow-index="' + workflowIndex + '" data-phase-index="' + phaseIndex + '">' + label + '</button>';
+    }
+
+    function duplicateWorkflow(workflow, workflowIndex) {
+      const next = deepClone(workflow);
+      next.id = uniqueWorkflowId(workflow.id + '-copy-' + (workflowIndex + 1));
+      next.name = uniqueWorkflowName(workflow.name + ' Copy');
+      return next;
+    }
+
     function createPhaseDraft(index) {
       const next = deepClone(initial.factory.createEmptyPhaseDraft);
       next.id = 'phase-' + (index + 1);
@@ -1019,6 +1299,30 @@ export function buildWorkflowConfigPanelHtml(
       next.artifact = 'PHASE-' + (index + 1) + '.md';
       next.output = '';
       return next;
+    }
+
+    function uniqueWorkflowId(baseId) {
+      const normalizedBase = normalize(baseId) || 'workflow';
+      let candidate = normalizedBase;
+      let suffix = 2;
+      const existingIds = new Set(draft.workflows.map((workflow) => normalize(workflow.id)));
+      while (existingIds.has(candidate)) {
+        candidate = normalizedBase + '-' + suffix;
+        suffix += 1;
+      }
+      return candidate;
+    }
+
+    function uniqueWorkflowName(baseName) {
+      const normalizedBase = normalize(baseName) || 'Workflow';
+      let candidate = normalizedBase;
+      let suffix = 2;
+      const existingNames = new Set(draft.workflows.map((workflow) => normalize(workflow.name).toLowerCase()));
+      while (existingNames.has(candidate.toLowerCase())) {
+        candidate = normalizedBase + ' ' + suffix;
+        suffix += 1;
+      }
+      return candidate;
     }
 
     function normalizeRelativePath(value) {
@@ -1030,8 +1334,26 @@ export function buildWorkflowConfigPanelHtml(
       return normalizeRelativePath(value);
     }
 
+    function setNestedValue(target, fieldPath, value) {
+      const segments = fieldPath.split('.');
+      let current = target;
+      for (let index = 0; index < segments.length - 1; index += 1) {
+        const segment = segments[index];
+        if (!current[segment] || typeof current[segment] !== 'object') {
+          current[segment] = {};
+        }
+        current = current[segment];
+      }
+
+      current[segments[segments.length - 1]] = value;
+    }
+
+    function isValidExecutionMode(value) {
+      return value === 'control' || value === 'pooled' || value === 'pinned';
+    }
+
     function isValidWorkspaceRelativePath(value) {
-      if (!value || value.startsWith('/') || /^[a-zA-Z]:\//.test(value)) {
+      if (!value || value.startsWith('/') || /^[a-zA-Z]:\\//.test(value)) {
         return false;
       }
 
@@ -1114,6 +1436,118 @@ function materializeFileBackedDraft(
   return { draft: nextDraft, issues };
 }
 
+function buildWorkflowRuntimePreviews(
+  draft: WorkflowEditorDraft,
+  workspaceRoot: string,
+): Record<string, WorkflowRuntimePreview> {
+  const configuration = vscode.workspace.getConfiguration('apexDelivery');
+  const provider = configuration.get<string>('copilot.provider', 'vscodeBuiltIn');
+  const userRole = configuration.get<string>('userRole', '');
+  const workspaceDefaults: PhaseRunPreferences = {
+    autoSubmit: configuration.get<boolean>('runPhase.autoSubmit', true),
+    agentTag: normalizePreviewString(configuration.get<string>('runPhase.agentTag', '')),
+    preferredChatAgent: normalizePreviewString(configuration.get<string>('runPhase.preferredChatAgent', '')),
+    starterPrompt: normalizePreviewString(configuration.get<string>('runPhase.starterPrompt', '')),
+    starterPromptPlacement: normalizeStarterPromptPlacement(configuration.get<string>('runPhase.starterPromptPlacement', 'prepend')) ?? 'prepend',
+  };
+  const rawRolePolicies = configuration.get<Record<string, unknown>>('runPhase.rolePolicies', {});
+  const rawPhaseProfiles = configuration.get<Record<string, unknown>>('runPhase.phaseProfiles', {});
+  const previews: Record<string, WorkflowRuntimePreview> = {};
+  const sampleEpicKey = 'APEX-1234';
+  const sampleEpicTitle = 'Preview Epic';
+  const sampleRoot = path.join('docs', 'ai-delivery', 'epics', sampleEpicKey);
+
+  draft.workflows.forEach((workflow, workflowIndex) => {
+    workflow.phases.forEach((phase, phaseIndex) => {
+      const workflowDefaults = {
+        autoSubmit: phase.sessionDefaults.autoSubmit === 'true'
+          ? true
+          : phase.sessionDefaults.autoSubmit === 'false'
+            ? false
+            : undefined,
+        agentTag: normalizePreviewString(phase.sessionDefaults.agentTag),
+        preferredChatAgent: normalizePreviewString(phase.sessionDefaults.preferredChatAgent),
+        starterPrompt: phase.sessionDefaults.starterPrompt,
+        starterPromptPlacement: normalizeStarterPromptPlacement(phase.sessionDefaults.starterPromptPlacement) ?? 'prepend',
+      };
+      const runPlan = resolvePhaseRunPlan({
+        userRole: normalizePreviewString(userRole),
+        workflowId: workflow.id,
+        phaseId: phase.id,
+        phaseOwner: normalizePreviewString(phase.owner),
+        workflowDefaults,
+        workspaceDefaults,
+        rawRolePolicies,
+        rawPhaseProfiles,
+      });
+      const promptSurfaces = buildPhasePromptSurfaces({
+        sessionMarker: 'APEX_SESSION=preview-session',
+        workspaceRootDisplayPath: workspaceRoot || '<workspace>',
+        epicDisplayPath: path.join(sampleRoot, 'EPIC.md'),
+        artifactDisplayPath: path.join(sampleRoot, phase.artifact || 'PHASE.md'),
+        artifactBasename: phase.artifact || 'PHASE.md',
+        statusDisplayPath: path.join(sampleRoot, '.apex', `${phase.id || 'phase'}.status.json`),
+        epicKey: sampleEpicKey,
+        epicTitle: sampleEpicTitle,
+        workflowId: workflow.id,
+        phaseId: phase.id,
+        phaseName: phase.name || 'Phase',
+        phaseStatus: 'pending',
+        phaseOutput: phase.output || '',
+        referenceText: [
+          '[EPIC.md]',
+          'Preview source text is rendered from the selected epic at runtime.',
+          '',
+          `[${phase.artifact || 'PHASE.md'}]`,
+          phase.output || 'Phase artifact content preview is not available in configuration.',
+          '',
+          '[status.json]',
+          `Phase: ${phase.name || 'Phase'}`,
+          `Expected output: ${phase.output || 'n/a'}`,
+        ].join('\n'),
+        branchNames: [],
+        pullRequestCount: 0,
+      }, runPlan.runPreferences);
+
+      previews[`${workflowIndex}:${phaseIndex}`] = {
+        provider,
+        roleLabel: formatPreviewRoleLabel(runPlan.rolePolicyResolution, phase.owner),
+        autoSubmitLabel: runPlan.runPreferences.autoSubmit ? 'true' : 'false',
+        preferredChatAgent: runPlan.runPreferences.preferredChatAgent,
+        agentTag: runPlan.runPreferences.agentTag,
+        starterPromptPlacement: runPlan.runPreferences.starterPromptPlacement,
+        promptSurfaces: {
+          scopedChat: promptSurfaces.scopedChat,
+          agent: promptSurfaces.agent,
+          cli: promptSurfaces.cli,
+        },
+        defaultSurface: provider === 'copilotCliPrompt' ? 'cli' : 'scopedChat',
+        sources: runPlan.sources,
+      };
+    });
+  });
+
+  return previews;
+}
+
+function formatPreviewRoleLabel(resolution: { userRole?: string; preferredRole?: string; status?: string }, phaseOwner: string): string {
+  if (!resolution.userRole) {
+    return normalizePreviewString(phaseOwner) || 'not configured';
+  }
+  if (resolution.status === 'mismatched' && resolution.preferredRole) {
+    return `${resolution.userRole} (phase prefers ${resolution.preferredRole})`;
+  }
+  return resolution.userRole;
+}
+
+function normalizePreviewString(value: unknown): string | undefined {
+  if (typeof value !== 'string') {
+    return undefined;
+  }
+  const normalized = value.trim();
+  return normalized.length > 0 ? normalized : undefined;
+}
+
 function createNonce(): string {
   const characters = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789';
   let value = '';
@@ -1121,4 +1555,25 @@ function createNonce(): string {
     value += characters.charAt(Math.floor(Math.random() * characters.length));
   }
   return value;
+}
+
+function buildRuntimePreviewContext(): {
+  provider: string;
+  userRole: string;
+  workspaceDefaults: Record<string, unknown>;
+  rolePolicies: Record<string, unknown>;
+} {
+  const configuration = vscode.workspace.getConfiguration('apexDelivery');
+  return {
+    provider: configuration.get<string>('copilot.provider', 'vscodeBuiltIn'),
+    userRole: configuration.get<string>('userRole', ''),
+    workspaceDefaults: {
+      autoSubmit: configuration.get<boolean>('runPhase.autoSubmit', true),
+      agentTag: configuration.get<string>('runPhase.agentTag', ''),
+      preferredChatAgent: configuration.get<string>('runPhase.preferredChatAgent', ''),
+      starterPrompt: configuration.get<string>('runPhase.starterPrompt', ''),
+      starterPromptPlacement: configuration.get<string>('runPhase.starterPromptPlacement', 'prepend'),
+    },
+    rolePolicies: configuration.get<Record<string, unknown>>('runPhase.rolePolicies', {}),
+  };
 }

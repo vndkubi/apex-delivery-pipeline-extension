@@ -21,6 +21,14 @@ export interface PhaseAutopilotPolicy {
   pauseOnManualIntervention?: boolean;
 }
 
+export const STARTER_PROMPT_PLACEMENTS = [
+  'prepend',
+  'append',
+  'replace',
+] as const;
+
+export type StarterPromptPlacement = typeof STARTER_PROMPT_PLACEMENTS[number];
+
 export interface PhaseSessionDefaults {
   autoSubmit?: boolean;
   agentTag?: string;
@@ -28,6 +36,26 @@ export interface PhaseSessionDefaults {
   preferredChatAgent?: string;
   starterPrompt?: string;
   starterPromptRef?: string;
+  starterPromptPlacement?: StarterPromptPlacement;
+}
+
+export const WORKFLOW_EXECUTION_MODES = [
+  'control',
+  'pooled',
+  'pinned',
+] as const;
+
+export type WorkflowExecutionMode = typeof WORKFLOW_EXECUTION_MODES[number];
+
+export interface WorkflowExecutionCommands {
+  runPhase?: WorkflowExecutionMode;
+  reviewPullRequest?: WorkflowExecutionMode;
+  openWorkspace?: WorkflowExecutionMode;
+}
+
+export interface WorkflowExecutionPolicy {
+  mode?: WorkflowExecutionMode;
+  commands?: WorkflowExecutionCommands;
 }
 
 export interface PhaseDefinition {
@@ -35,6 +63,7 @@ export interface PhaseDefinition {
   name: string;
   owner: string;
   artifact: string;
+  enabled?: boolean;
   templateRef?: string;
   outputRef?: string;
   gate: 'Gate 1' | 'Gate 2' | 'Gate 3';
@@ -48,6 +77,7 @@ export interface PhaseStatus {
   name: string;
   owner: string;
   artifact: string;
+  enabled?: boolean;
   templateRef?: string;
   outputRef?: string;
   artifactPath: string;
@@ -67,6 +97,7 @@ export interface EpicStatus {
   folderPath: string;
   workflowId: string;
   workflowName: string;
+  execution?: WorkflowExecutionPolicy;
   phases: PhaseStatus[];
   currentPhaseIndex: number;
   progress: number;
@@ -157,6 +188,14 @@ export const DEFAULT_PHASES: readonly PhaseDefinition[] = [
 
 export function isPhaseStatusValue(value: unknown): value is PhaseStatusValue {
   return typeof value === 'string' && (PHASE_STATUS_VALUES as readonly string[]).includes(value);
+}
+
+export function isWorkflowExecutionMode(value: unknown): value is WorkflowExecutionMode {
+  return typeof value === 'string' && (WORKFLOW_EXECUTION_MODES as readonly string[]).includes(value);
+}
+
+export function isStarterPromptPlacement(value: unknown): value is StarterPromptPlacement {
+  return typeof value === 'string' && (STARTER_PROMPT_PLACEMENTS as readonly string[]).includes(value);
 }
 
 export function isCompletedStatus(status: PhaseStatusValue): boolean {

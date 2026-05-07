@@ -1,19 +1,39 @@
 import * as fs from 'fs';
-import type { PhaseAutopilotPolicy, PhaseDefinition } from './pipelineModel';
+import type {
+  PhaseAutopilotPolicy,
+  WorkflowExecutionMode,
+  WorkflowExecutionPolicy,
+} from './pipelineModel';
 import { isWorkspaceTemplateRef, normalizeTemplateRef, resolveTemplateRefPath, validateTemplateRef } from './templateRef';
 import { normalizeWorkspaceTextRef, readWorkspaceTextRef, resolveWorkspaceTextRefPath, validateWorkspaceTextRef } from './workspaceTextRef';
-import { DEFAULT_WORKFLOW_ID, type WorkflowDefinition } from './workflowModel';
+import {
+  DEFAULT_WORKFLOW_ID,
+  getPbiDeliveryWorkflowDefinition,
+  type WorkflowDefinition,
+} from './workflowModel';
 
 export type WorkflowEditorTemplateMode = 'artifact' | 'bundled' | 'workspace';
 export type WorkflowEditorAutoSubmitMode = 'inherit' | 'true' | 'false';
 export type WorkflowEditorTextMode = 'inline' | 'file';
 
+export interface WorkflowEditorExecutionCommandsDraft {
+  runPhase: WorkflowExecutionMode;
+  reviewPullRequest: WorkflowExecutionMode;
+  openWorkspace: WorkflowExecutionMode;
+}
+
+export interface WorkflowEditorExecutionDraft {
+  configured: boolean;
+  mode: WorkflowExecutionMode;
+  commands: WorkflowEditorExecutionCommandsDraft;
+}
+
 export interface WorkflowEditorSessionDefaultsDraft {
   autoSubmit: WorkflowEditorAutoSubmitMode;
   agentTag: string;
   preferredChatAgent: string;
-  modelFamily: string;
   starterPromptMode: WorkflowEditorTextMode;
+  starterPromptPlacement: 'prepend' | 'append' | 'replace';
   starterPrompt: string;
   starterPromptRef: string;
 }
@@ -23,6 +43,7 @@ export interface WorkflowEditorPhaseDraft {
   name: string;
   owner: string;
   artifact: string;
+  enabled: boolean;
   gate: string;
   outputMode: WorkflowEditorTextMode;
   output: string;
@@ -36,6 +57,7 @@ export interface WorkflowEditorPhaseDraft {
 export interface WorkflowEditorWorkflowDraft {
   id: string;
   name: string;
+  execution: WorkflowEditorExecutionDraft;
   phases: WorkflowEditorPhaseDraft[];
 }
 
@@ -50,6 +72,7 @@ export interface WorkflowEditorValidationIssue {
 
 const VALID_GATES: ReadonlySet<string> = new Set(['Gate 1', 'Gate 2', 'Gate 3']);
 const ARTIFACT_FILENAME_PATTERN = /^[^\\/]+\.md$/i;
+const VALID_EXECUTION_MODES: ReadonlySet<WorkflowExecutionMode> = new Set(['control', 'pooled', 'pinned']);
 
 export function listBundledTemplateRefs(templateRoot: string): readonly string[] {
   if (!fs.existsSync(templateRoot)) {
@@ -67,11 +90,13 @@ export function buildWorkflowEditorDraft(workflows: readonly WorkflowDefinition[
     workflows: workflows.map((workflow) => ({
       id: workflow.id,
       name: workflow.name,
+      execution: buildExecutionDraft(workflow.execution),
       phases: workflow.phases.map((phase) => ({
         id: phase.id,
         name: phase.name,
         owner: phase.owner,
         artifact: phase.artifact,
+        enabled: phase.enabled !== false,
         gate: phase.gate,
         outputMode: phase.outputRef ? 'file' : 'inline',
         output: phase.output,
@@ -84,8 +109,8 @@ export function buildWorkflowEditorDraft(workflows: readonly WorkflowDefinition[
             : phase.sessionDefaults.autoSubmit ? 'true' : 'false',
           agentTag: phase.sessionDefaults?.agentTag ?? '',
           preferredChatAgent: phase.sessionDefaults?.preferredChatAgent ?? '',
-          modelFamily: phase.sessionDefaults?.modelFamily ?? '',
           starterPromptMode: phase.sessionDefaults?.starterPromptRef ? 'file' : 'inline',
+          starterPromptPlacement: phase.sessionDefaults?.starterPromptPlacement ?? 'prepend',
           starterPrompt: phase.sessionDefaults?.starterPrompt ?? '',
           starterPromptRef: phase.sessionDefaults?.starterPromptRef ?? '',
         },
@@ -99,6 +124,7 @@ export function createEmptyWorkflowDraft(index: number): WorkflowEditorWorkflowD
   return {
     id: `workflow-${index + 1}`,
     name: 'New Workflow',
+    execution: createDefaultExecutionDraft(false),
     phases: [createEmptyPhaseDraft(0)],
   };
 }
@@ -109,6 +135,7 @@ export function createEmptyPhaseDraft(index: number): WorkflowEditorPhaseDraft {
     name: 'New Phase',
     owner: '',
     artifact: `PHASE-${index + 1}.md`,
+    enabled: true,
     gate: 'Gate 1',
     outputMode: 'inline',
     output: '',
@@ -119,8 +146,8 @@ export function createEmptyPhaseDraft(index: number): WorkflowEditorPhaseDraft {
       autoSubmit: 'inherit',
       agentTag: '',
       preferredChatAgent: '',
-      modelFamily: '',
       starterPromptMode: 'inline',
+      starterPromptPlacement: 'prepend',
       starterPrompt: '',
       starterPromptRef: '',
     },
@@ -151,8 +178,13 @@ export function validateWorkflowEditorDraft(
       issues.push(issue(`workflow.${workflowIndex}.name`, 'Workflow name is required.'));
     }
 
+    issues.push(...validateExecutionDraft(workflow.execution, workflowIndex));
+
     if (workflow.phases.length === 0) {
       issues.push(issue(`workflow.${workflowIndex}.phases`, 'At least one phase is required.'));
+    }
+    if (!workflow.phases.some((phase) => phase.enabled !== false)) {
+      issues.push(issue(`workflow.${workflowIndex}.phases`, 'At least one enabled phase is required.'));
     }
 
     const seenPhaseIds = new Set<string>();
@@ -169,6 +201,10 @@ export function validateWorkflowEditorDraft(
 
       if (phase.name.trim().length === 0) {
         issues.push(issue(`${phasePrefix}.name`, 'Phase name is required.'));
+      }
+
+      if (phase.enabled === false) {
+        continue;
       }
 
       if (phase.owner.trim().length === 0) {
@@ -218,7 +254,7 @@ export function serializeWorkflowEditorDraft(draft: WorkflowEditorDraft): Record
 
   for (const workflow of draft.workflows) {
     const workflowId = workflow.id.trim();
-    serialized[workflowId] = {
+    const serializedWorkflow: Record<string, unknown> = {
       name: workflow.name.trim(),
       phases: workflow.phases.map((phase) => {
         const serializedPhase: Record<string, unknown> = {
@@ -229,6 +265,10 @@ export function serializeWorkflowEditorDraft(draft: WorkflowEditorDraft): Record
           gate: phase.gate.trim(),
           output: phase.outputMode === 'inline' ? phase.output.trim() : phase.output,
         };
+
+        if (phase.enabled === false) {
+          serializedPhase.enabled = false;
+        }
 
         const outputRef = serializeTextRef(phase.outputMode, phase.outputRef);
         if (outputRef) {
@@ -253,9 +293,91 @@ export function serializeWorkflowEditorDraft(draft: WorkflowEditorDraft): Record
         return serializedPhase;
       }),
     };
+
+    const execution = serializeExecutionPolicy(workflow.execution);
+    if (execution) {
+      serializedWorkflow.execution = execution;
+    }
+
+    serialized[workflowId] = serializedWorkflow;
   }
 
   return serialized;
+}
+
+export function buildWorkflowPresetDrafts(): readonly WorkflowEditorWorkflowDraft[] {
+  return [workflowToDraft(getPbiDeliveryWorkflowDefinition())];
+}
+
+export function duplicateWorkflowDraft(workflow: WorkflowEditorWorkflowDraft, index: number): WorkflowEditorWorkflowDraft {
+  const cloned = JSON.parse(JSON.stringify(workflow)) as WorkflowEditorWorkflowDraft;
+  cloned.id = `${workflow.id}-copy-${index + 1}`;
+  cloned.name = `${workflow.name} Copy`;
+  return cloned;
+}
+
+function buildExecutionDraft(execution: WorkflowExecutionPolicy | undefined): WorkflowEditorExecutionDraft {
+  return {
+    configured: execution !== undefined,
+    mode: execution?.mode ?? 'control',
+    commands: {
+      runPhase: execution?.commands?.runPhase ?? 'control',
+      reviewPullRequest: execution?.commands?.reviewPullRequest ?? 'control',
+      openWorkspace: execution?.commands?.openWorkspace ?? 'pinned',
+    },
+  };
+}
+
+function createDefaultExecutionDraft(configured: boolean): WorkflowEditorExecutionDraft {
+  return {
+    configured,
+    mode: 'control',
+    commands: {
+      runPhase: 'control',
+      reviewPullRequest: 'control',
+      openWorkspace: 'pinned',
+    },
+  };
+}
+
+function validateExecutionDraft(
+  execution: WorkflowEditorExecutionDraft,
+  workflowIndex: number,
+): WorkflowEditorValidationIssue[] {
+  const issues: WorkflowEditorValidationIssue[] = [];
+  if (!VALID_EXECUTION_MODES.has(execution.mode)) {
+    issues.push(issue(`workflow.${workflowIndex}.execution.mode`, 'Default execution mode must be control, pooled, or pinned.'));
+  }
+  if (!VALID_EXECUTION_MODES.has(execution.commands.runPhase)) {
+    issues.push(issue(`workflow.${workflowIndex}.execution.commands.runPhase`, 'Run Phase execution must be control, pooled, or pinned.'));
+  }
+  if (!VALID_EXECUTION_MODES.has(execution.commands.reviewPullRequest)) {
+    issues.push(issue(`workflow.${workflowIndex}.execution.commands.reviewPullRequest`, 'Review Pull Request execution must be control, pooled, or pinned.'));
+  }
+  if (!VALID_EXECUTION_MODES.has(execution.commands.openWorkspace)) {
+    issues.push(issue(`workflow.${workflowIndex}.execution.commands.openWorkspace`, 'Open Workspace execution must be control, pooled, or pinned.'));
+  }
+  return issues;
+}
+
+function serializeExecutionPolicy(execution: WorkflowEditorExecutionDraft): WorkflowExecutionPolicy | undefined {
+  const hasNonDefaultValue = execution.mode !== 'control'
+    || execution.commands.runPhase !== 'control'
+    || execution.commands.reviewPullRequest !== 'control'
+    || execution.commands.openWorkspace !== 'pinned';
+
+  if (!execution.configured && !hasNonDefaultValue) {
+    return undefined;
+  }
+
+  return {
+    mode: execution.mode,
+    commands: {
+      runPhase: execution.commands.runPhase,
+      reviewPullRequest: execution.commands.reviewPullRequest,
+      openWorkspace: execution.commands.openWorkspace,
+    },
+  };
 }
 
 function getTemplateMode(templateRef: string | undefined): WorkflowEditorTemplateMode {
@@ -337,8 +459,8 @@ function serializeSessionDefaults(sessionDefaults: WorkflowEditorSessionDefaults
     serialized.preferredChatAgent = sessionDefaults.preferredChatAgent.trim();
   }
 
-  if (sessionDefaults.modelFamily.trim().length > 0) {
-    serialized.modelFamily = sessionDefaults.modelFamily.trim();
+  if (sessionDefaults.starterPromptPlacement !== 'prepend') {
+    serialized.starterPromptPlacement = sessionDefaults.starterPromptPlacement;
   }
 
   if (sessionDefaults.starterPromptMode === 'inline') {
@@ -416,4 +538,8 @@ function sanitizeAutopilot(autopilot: PhaseAutopilotPolicy | undefined): PhaseAu
 
 function issue(path: string, message: string): WorkflowEditorValidationIssue {
   return { path, message };
+}
+
+function workflowToDraft(workflow: WorkflowDefinition): WorkflowEditorWorkflowDraft {
+  return buildWorkflowEditorDraft([workflow]).workflows[0]!;
 }

@@ -21,9 +21,29 @@ import {
   type GuidedAutopilotState,
 } from './autopilotStateStore';
 import {
+  buildPullRequestFolderName,
+  formatPullRequestDisplay,
+  getBindBranchToEpicCommandOptions,
+  getCreateSampleEpicCommandOptions,
+  getIntegratedFlowCommandOptions,
+  getLinkBranchToEpicCommandOptions,
+  getOpenLinkedBranchWorktreeCommandOptions,
+  getPhaseCommandOptions as parsePhaseCommandOptions,
+  getReviewPullRequestCommandOptions,
+  normalizePullRequestInput,
+  parseGuidedAutopilotExecutionMode,
+  sanitizePathSegment,
+  type GuidedAutopilotExecutionMode,
+  type IntegratedFlowCommandOptions,
+  type NormalizedPullRequestInput,
+  type PhaseCommandOptions,
+  type ReviewPullRequestCommandOptions,
+} from './commandOptions';
+import {
   type CoordinationPullRequestBinding,
   createDefaultCoordinationMetadata,
   readCoordinationMetadata,
+  withoutBranchBinding,
   withBranchBinding,
   writeCoordinationMetadata,
 } from './coordinationModel';
@@ -41,6 +61,7 @@ import {
 import { DEFAULT_PHASES, EpicStatus, PhaseStatus, phaseDefinitionById, resolvePhaseTemplateRef } from './pipelineModel';
 import { EpicItem, PhaseItem, PipelineProvider } from './pipelineProvider';
 import { PipelineScanner, writePhaseStatus } from './pipelineScanner';
+import { registerPbiCommands, type PbiPhaseCommandResult } from './pbiCommands';
 import { buildPortfolioSnapshot, type PortfolioSnapshot } from './portfolioModel';
 import {
   buildPullRequestReviewContextJson,
@@ -49,7 +70,24 @@ import {
   upsertPullRequestReviewSection,
   type PullRequestReviewArtifactContext,
 } from './prReviewArtifacts';
-import { resolveRolePolicy, type RolePolicyResolution } from './rolePolicy';
+import {
+  buildCopilotCliHandoff,
+  isPbiDeliveryWorkflow,
+  listPbiReferencePaths,
+} from './pbiWorkflow';
+import {
+  buildCopilotAgentStarter as renderCopilotAgentStarter,
+  buildCopilotCliPrompt as renderCopilotCliPrompt,
+  buildDirectModelPrompt as renderDirectModelPrompt,
+  buildScopedChatStarter as renderScopedChatStarter,
+  normalizeStarterPromptPlacement,
+  type PhaseRunProfileOverride,
+  resolvePhaseRunPlan,
+  resolvePhaseRunProfileOverride,
+  type PhasePromptRenderContext,
+  type PhaseRunPreferences as SharedPhaseRunPreferences,
+} from './phaseRunPlan';
+import type { RolePolicyResolution } from './rolePolicy';
 import { createSpecKitWorkspace } from './specKitWorkspace';
 import type { SpecKitWorkspaceResult } from './specKitWorkspace';
 import { TemplateContext, writeFromTemplate } from './templateRenderer';
@@ -61,6 +99,7 @@ import {
   parseWorkflowDefinitions,
   type WorkflowDefinition,
 } from './workflowModel';
+import { resolveParticipantPromptContext } from './participantPromptContext';
 
 interface PhaseCommandArgs {
   phase: PhaseStatus | undefined;
@@ -74,50 +113,12 @@ interface CurrentBranchEpicContext {
   error?: string;
 }
 
-interface PhaseCommandOptions {
-  nonInteractive: boolean;
-  forceChatFallback: boolean;
-  autopilotExecutionMode: GuidedAutopilotExecutionMode;
-}
-
-type GuidedAutopilotExecutionMode = 'agent-pause' | 'fully-automatic';
-
-interface CreateSampleEpicCommandOptions {
-  nonInteractive: boolean;
-  workflowId?: string;
-}
-
-interface LinkBranchToEpicCommandOptions {
-  nonInteractive: boolean;
-  branchName?: string;
-}
-
-interface OpenLinkedBranchWorktreeCommandOptions {
-  nonInteractive: boolean;
-  branchName?: string;
-  openInNewWindow?: boolean;
-}
-
 interface OpenLinkedBranchWorktreeCommandResult {
   epicKey: string;
   branchName: string;
   worktreePath: string;
   created: boolean;
   openedInNewWindow: boolean;
-}
-
-interface ReviewPullRequestCommandOptions {
-  nonInteractive: boolean;
-  prInput?: string;
-  prNumber?: number;
-  prUrl?: string;
-  prTitle?: string;
-  baseBranch?: string;
-  headBranch?: string;
-  author?: string;
-  provider?: string;
-  linkedEpicKey?: string;
-  openArtifact?: boolean;
 }
 
 interface ReviewPullRequestCommandResult {
@@ -133,13 +134,6 @@ interface ReviewPullRequestCommandResult {
   headBranch?: string;
   executionWorkspacePath?: string;
   blockedReason?: string;
-}
-
-interface IntegratedFlowCommandOptions {
-  nonInteractive: boolean;
-  openSpec: boolean;
-  title?: string;
-  source?: string;
 }
 
 interface PhaseContextFile {
@@ -163,7 +157,7 @@ interface PhaseSessionContext {
   references: readonly PhaseContextFile[];
 }
 
-interface PhaseRunPreferences {
+interface PhaseRunPreferences extends SharedPhaseRunPreferences {
   autoSubmit: boolean;
   agentTag?: string;
   modelFamily?: string;
@@ -171,13 +165,13 @@ interface PhaseRunPreferences {
   starterPrompt?: string;
 }
 
+type CopilotProviderMode = 'vscodeBuiltIn' | 'copilotCliPrompt';
+
 interface PhaseExecutionResolution {
   runPreferences: PhaseRunPreferences;
   preferredAgentStatus: PreferredChatAgentStatus;
   rolePolicyResolution: RolePolicyResolution;
 }
-
-type PhaseRunProfileOverride = Partial<PhaseRunPreferences>;
 
 interface PhaseProfileTarget {
   id: PhaseStatus['id'];
@@ -223,7 +217,7 @@ type DirectPhaseRunResult =
   };
 
 interface PhaseCommandResult {
-  mode: 'agent-chat' | 'direct' | 'chat-fallback' | 'blocked';
+  mode: 'agent-chat' | 'direct' | 'chat-fallback' | 'cli-handoff' | 'blocked';
   artifactPath: string;
   sessionId?: string;
   transportId?: string;
@@ -237,6 +231,8 @@ interface PhaseCommandResult {
   preferredAgentStatus?: PreferredChatAgentStatus;
   runPreferences?: PhaseRunPreferences;
   rolePolicyResolution?: RolePolicyResolution;
+  handoffPath?: string;
+  handoffCommand?: string;
 }
 
 interface IntegratedFlowCommandResult {
@@ -326,6 +322,11 @@ export function activate(context: vscode.ExtensionContext): void {
       payload.preferredModelFamily,
     ),
   };
+  const copilotCliPromptTransport = {
+    id: 'copilot-cli-prompt',
+    stability: 'best-effort-command' as const,
+    supportsExactSessionTargeting: false,
+  };
   const statusBar = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Left, 50);
   statusBar.command = 'apexDelivery.openDashboard';
   statusBar.tooltip = 'Open APEX Delivery Dashboard';
@@ -335,19 +336,6 @@ export function activate(context: vscode.ExtensionContext): void {
   const rememberPhaseSession = (session: PhaseSessionContext): void => {
     phaseSessions.set(session.sessionKey, session);
     lastPhaseSessionKey = session.sessionKey;
-  };
-
-  const resolvePhaseSessionForPrompt = (prompt: string): PhaseSessionContext | undefined => {
-    const sessionKey = extractPhaseChatSessionKey(prompt);
-    if (sessionKey) {
-      return phaseSessions.get(sessionKey);
-    }
-
-    if (!lastPhaseSessionKey) {
-      return undefined;
-    }
-
-    return phaseSessions.get(lastPhaseSessionKey);
   };
 
   const appendRunTrace = async (entry: PhaseRunTraceEntry): Promise<void> => {
@@ -466,11 +454,39 @@ export function activate(context: vscode.ExtensionContext): void {
   }));
 
   const participant = vscode.chat.createChatParticipant(APEX_CHAT_PARTICIPANT_ID, async (request, _chatContext, stream, token) => {
-    const session = resolvePhaseSessionForPrompt(request.prompt);
+    const fallbackTarget = (() => {
+      const target = resolveCommandTarget(undefined);
+      return target.phase && target.epic
+        ? { phase: target.phase, epic: target.epic }
+        : undefined;
+    })();
+
+    const participantContext = resolveParticipantPromptContext(request.prompt, {
+      extractSessionKey: extractPhaseChatSessionKey,
+      getSessionByKey: (key) => phaseSessions.get(key),
+      lastSessionKey: lastPhaseSessionKey,
+      fallbackTarget,
+    });
+
+    let session: PhaseSessionContext | undefined;
+    if (participantContext.kind === 'session') {
+      session = participantContext.session;
+    } else if (participantContext.kind === 'target') {
+      session = await resolvePhaseSessionContext(
+        phaseSessionProvider,
+        participantContext.target.phase,
+        participantContext.target.epic,
+        workspaceRoot,
+      );
+      rememberPhaseSession(session);
+    }
+
     if (!session) {
-      stream.markdown('Run **APEX Delivery: Run Phase with Copilot** on a phase first, then continue here with `@apex`.');
+      stream.markdown('Select a phase in **APEX Delivery**, open an epic-linked branch, or run **APEX Delivery: Run Phase with Copilot** first, then continue here with `@apex`.');
       return;
     }
+
+    rememberPhaseSession(session);
 
     stream.progress(`Using ${session.epic.key} / ${session.phase.name} context.`);
     stream.reference(vscode.Uri.file(path.join(session.epic.folderPath, 'EPIC.md')));
@@ -529,59 +545,103 @@ export function activate(context: vscode.ExtensionContext): void {
     await vscode.commands.executeCommand('vscode.open', vscode.Uri.file(path.join(result.folderPath, 'EPIC.md')));
     void vscode.window.showInformationMessage(`Created sample epic ${result.epicKey} with workflow ${result.workflowName}.`);
   }));
+  registerPbiCommands({
+    context,
+    workspaceRoot,
+    templateRoot,
+    output,
+    gitService,
+    getEpicsPath,
+    getOwner,
+    refreshPipeline,
+    getEpics: () => provider.getEpics(),
+    getCurrentBranchContext: () => currentBranchContext,
+    resolveEpicCommandTarget,
+    resolveLatestEpicState,
+    unwrapPhaseArgs,
+    pickEpicForCommand,
+    ensurePhaseArtifactExists,
+    resolvePhaseSessionContext: (phase, epic, resolvedWorkspaceRoot) => resolvePhaseSessionContext(phaseSessionProvider, phase, epic, resolvedWorkspaceRoot),
+    getPhaseExecutionResolution,
+    createCopilotCliPhaseHandoff: (session, runPreferences, phaseOutput) => createCopilotCliPhaseHandoff(session as PhaseSessionContext, runPreferences, phaseOutput),
+    runPhaseInCopilot: (request) => vscode.commands.executeCommand<PbiPhaseCommandResult | undefined>('apexDelivery.runPhaseInCopilot', request),
+    normalizeNonEmptyString,
+  });
 
-  context.subscriptions.push(vscode.commands.registerCommand('apexDelivery.linkCurrentBranchToEpic', async (first: unknown, second?: EpicStatus) => {
+  context.subscriptions.push(vscode.commands.registerCommand('apexDelivery.bindBranchToEpic', async (first: unknown, second?: EpicStatus) => {
     refreshPipeline();
-    const branchResult = gitService.getCurrentBranch(workspaceRoot);
-    if (!branchResult.branchName) {
-      void vscode.window.showWarningMessage(branchResult.error ?? 'Current Git branch could not be resolved.');
-      return;
-    }
-
     const epics = provider.getEpics();
     if (epics.length === 0) {
-      void vscode.window.showWarningMessage('No delivery epics found. Create or add an epic before linking the current branch.');
+      void vscode.window.showWarningMessage('No delivery epics found. Create or add an epic before binding a branch.');
       return;
     }
 
-    const linked = await linkBranchToEpic(epics, branchResult.branchName, first, second, output, 'current');
-    if (linked) {
+    const result = await bindBranchToEpicCommand(epics, workspaceRoot, gitService, first, second, output);
+    if (result) {
       refreshPipeline();
     }
+    return result;
+  }));
+
+  context.subscriptions.push(vscode.commands.registerCommand('apexDelivery.manageCurrentBranchBinding', async () => {
+    refreshPipeline();
+    const epics = provider.getEpics();
+    if (epics.length === 0) {
+      void vscode.window.showWarningMessage('No delivery epics found. Create or add an epic before managing branch bindings.');
+      return;
+    }
+
+    const result = await manageCurrentBranchBindingCommand(epics, workspaceRoot, gitService, output);
+    if (result) {
+      refreshPipeline();
+    }
+    return result;
+  }));
+
+  context.subscriptions.push(vscode.commands.registerCommand('apexDelivery.linkCurrentBranchToEpic', async (first: unknown, second?: EpicStatus) => {
+    return vscode.commands.executeCommand('apexDelivery.bindBranchToEpic', {
+      useCurrentBranch: true,
+    }, resolveEpicCommandTarget(first, second));
+  }));
+
+  context.subscriptions.push(vscode.commands.registerCommand('apexDelivery.linkCurrentBranchAndOpenPinnedWorkspace', async (first: unknown, second?: EpicStatus) => {
+    return vscode.commands.executeCommand('apexDelivery.bindBranchToEpic', {
+      useCurrentBranch: true,
+      openPinnedWorkspace: true,
+    }, resolveEpicCommandTarget(first, second));
   }));
 
   context.subscriptions.push(vscode.commands.registerCommand('apexDelivery.linkBranchToEpic', async (first: unknown, second?: EpicStatus) => {
-    refreshPipeline();
     const options = getLinkBranchToEpicCommandOptions(first);
+    return vscode.commands.executeCommand('apexDelivery.bindBranchToEpic', {
+      branchName: options.branchName,
+      nonInteractive: options.nonInteractive,
+    }, resolveEpicCommandTarget(first, second));
+  }));
+
+  context.subscriptions.push(vscode.commands.registerCommand('apexDelivery.unlinkBranchFromEpic', async (first: unknown, second?: EpicStatus) => {
+    refreshPipeline();
     const epics = provider.getEpics();
-    if (epics.length === 0) {
-      void vscode.window.showWarningMessage('No delivery epics found. Create or add an epic before linking a branch.');
-      return;
-    }
-
-    let branchName = options.branchName?.trim();
-    if (!branchName) {
-      if (options.nonInteractive) {
-        void vscode.window.showWarningMessage('Provide a branch name to link when running APEX: Link Branch To Epic non-interactively.');
-        return;
-      }
-
-      const branches = gitService.listLocalBranches(workspaceRoot);
-      if (branches.length === 0) {
-        void vscode.window.showWarningMessage('No local Git branches were found to link.');
-        return;
-      }
-
-      branchName = await pickBranchForLink(branches);
-      if (!branchName) {
-        return;
-      }
-    }
-
-    const linked = await linkBranchToEpic(epics, branchName, first, second, output, 'selected');
-    if (linked) {
+    const result = await unlinkBranchFromEpicCommand(epics, first, second, output);
+    if (result) {
       refreshPipeline();
     }
+    return result;
+  }));
+
+  context.subscriptions.push(vscode.commands.registerCommand('apexDelivery.moveBranchToEpic', async (first: unknown, second?: EpicStatus) => {
+    refreshPipeline();
+    const epics = provider.getEpics();
+    const result = await moveBranchToEpicCommand(epics, first, second, output);
+    if (result) {
+      refreshPipeline();
+    }
+    return result;
+  }));
+
+  context.subscriptions.push(vscode.commands.registerCommand('apexDelivery.inspectEpicBranchBindings', async (first: unknown, second?: EpicStatus) => {
+    refreshPipeline();
+    return inspectEpicBranchBindingsCommand(provider.getEpics(), first, second, output);
   }));
 
   context.subscriptions.push(vscode.commands.registerCommand('apexDelivery.openLinkedBranchWorktree', async (first: unknown, second?: EpicStatus) => {
@@ -589,13 +649,13 @@ export function activate(context: vscode.ExtensionContext): void {
     const options = getOpenLinkedBranchWorktreeCommandOptions(first);
     const epics = provider.getEpics();
     if (epics.length === 0) {
-      void vscode.window.showWarningMessage('No delivery epics found. Create or add an epic before opening a linked branch worktree.');
+      void vscode.window.showWarningMessage('No delivery epics found. Create or add an epic before opening a pinned branch workspace.');
       return;
     }
 
     const targetEpic = resolveEpicCommandTarget(first, second)
       ?? currentBranchContext.epic
-      ?? await pickEpicForCommand(epics, 'Open Linked Branch Worktree', 'Choose an epic whose linked branch worktree should open.');
+      ?? await pickEpicForCommand(epics, 'Open Pinned Branch Workspace', 'Choose an epic whose pinned branch workspace should open.');
     const latestTargetEpic = resolveLatestEpicState(epics, targetEpic);
     if (!latestTargetEpic) {
       return;
@@ -608,15 +668,15 @@ export function activate(context: vscode.ExtensionContext): void {
         explicitBranchName: options.branchName,
         allowPrompt: !options.nonInteractive,
         preferCurrentBranch: false,
-        promptTitle: 'Open Linked Branch Worktree',
-        promptPlaceHolder: `Choose a linked branch for ${latestTargetEpic.key}.`,
+        promptTitle: 'Open Pinned Branch Workspace',
+        promptPlaceHolder: `Choose a linked branch to open as a pinned workspace for ${latestTargetEpic.key}.`,
       },
     );
     if (branchResolution.status === 'cancelled') {
       return;
     }
     if (branchResolution.status !== 'resolved') {
-      reportEpicExecutionIssue(workspaceRoot, output, latestTargetEpic, branchResolution, gitService.getCurrentBranch(workspaceRoot), 'Open Linked Branch Worktree');
+      reportEpicExecutionIssue(output, latestTargetEpic, branchResolution, gitService.getCurrentBranch(workspaceRoot), 'Open Pinned Branch Workspace');
       return;
     }
 
@@ -628,14 +688,14 @@ export function activate(context: vscode.ExtensionContext): void {
     const desiredWorktreePath = buildSuggestedWorktreePath(workspaceRoot, resolvedBranchName);
     const worktreeResult = gitService.ensureWorktreeForBranch(workspaceRoot, resolvedBranchName, desiredWorktreePath);
     if (!worktreeResult.worktreePath) {
-      const message = `APEX could not open the linked worktree for ${latestTargetEpic.key}. Expected branch "${resolvedBranchName}". Next action: recreate the branch locally or resolve the worktree path issue. ${worktreeResult.error ?? ''}`.trim();
+      const message = `APEX could not open the pinned branch workspace for ${latestTargetEpic.key}. Expected branch "${resolvedBranchName}". Next action: recreate the branch locally or resolve the workspace path issue. ${worktreeResult.error ?? ''}`.trim();
       output.appendLine(`[Worktree] ${message}`);
       void vscode.window.showWarningMessage(message);
       return;
     }
 
     const openInNewWindow = options.openInNewWindow !== false;
-    output.appendLine(`[Worktree] ${worktreeResult.created ? 'Created' : 'Reusing'} linked worktree for ${latestTargetEpic.key}. Branch: ${resolvedBranchName}. Path: ${worktreeResult.worktreePath}`);
+    output.appendLine(`[Worktree] ${worktreeResult.created ? 'Created' : 'Reusing'} pinned branch workspace for ${latestTargetEpic.key}. Branch: ${resolvedBranchName}. Path: ${worktreeResult.worktreePath}`);
     await vscode.commands.executeCommand('vscode.openFolder', vscode.Uri.file(worktreeResult.worktreePath), openInNewWindow);
     return {
       epicKey: latestTargetEpic.key,
@@ -734,17 +794,79 @@ export function activate(context: vscode.ExtensionContext): void {
 
     ensurePhaseArtifactExists(phase, epic, workspaceRoot, templateRoot, getOwner(), output, refreshPipeline);
 
-  let session = await resolvePhaseSessionContext(phaseSessionProvider, phase, epic, workspaceRoot);
+    let session = await resolvePhaseSessionContext(phaseSessionProvider, phase, epic, workspaceRoot);
     const verificationEvidence = await attachVerificationEvidence(session, output, options.nonInteractive);
-  session = await resolvePhaseSessionContext(phaseSessionProvider, phase, epic, workspaceRoot);
+    session = await resolvePhaseSessionContext(phaseSessionProvider, phase, epic, workspaceRoot);
     const executionResolution = getPhaseExecutionResolution(epic, phase);
-    const runPreferences = executionResolution.runPreferences;
-    const preferredAgentStatus = executionResolution.preferredAgentStatus;
+    const { runPreferences, preferredAgentStatus } = executionResolution;
     rememberPhaseSession(session);
     const contextFiles = buildTraceContextFiles(session);
     reportPreferredChatAgentStatus(session, preferredAgentStatus, output, options.nonInteractive);
-    if (!await confirmRoleRouting(session, executionResolution.rolePolicyResolution, options.nonInteractive)) {
+    if (!await confirmRoleRouting(executionResolution.rolePolicyResolution, options.nonInteractive)) {
       return;
+    }
+
+    if (resolveCopilotProvider() === 'copilotCliPrompt') {
+      if (options.nonInteractive && options.autopilotExecutionMode === 'fully-automatic') {
+        const reason = 'Copilot CLI prompt handoff does not support fully automatic execution. Switch apexDelivery.copilot.provider to vscodeBuiltIn for automatic phase runs.';
+        output.appendLine(`[Copilot] ${reason}`);
+        return {
+          mode: 'blocked',
+          artifactPath: phase.artifactPath,
+          ...buildPhaseSessionResultMetadata(session),
+          fallbackReason: reason,
+          verification: verificationEvidence.records,
+          preferredAgentStatus,
+          runPreferences,
+          rolePolicyResolution: executionResolution.rolePolicyResolution,
+        } satisfies PhaseCommandResult;
+      }
+
+      session = await bindPhaseSessionTransport(
+        phaseSessionProvider,
+        session,
+        copilotCliPromptTransport,
+        {
+          launchMode: 'ask',
+        },
+      );
+      const handoff = await createCopilotCliPhaseHandoff(session, runPreferences, output);
+      session = await markPhaseSessionStatus(
+        phaseSessionProvider,
+        session,
+        'opened',
+        `Generated Copilot CLI handoff at ${handoff.promptPath}.`,
+      );
+      await appendRunTrace(buildPhaseRunTraceEntry(
+        session,
+        'cli-handoff',
+        'Generated Copilot CLI prompt handoff.',
+        handoff.content,
+        contextFiles,
+        verificationEvidence.records,
+        preferredAgentStatus,
+        executionResolution.rolePolicyResolution,
+        undefined,
+        handoff.command,
+      ));
+
+      if (!options.nonInteractive) {
+        await vscode.commands.executeCommand('vscode.open', vscode.Uri.file(handoff.promptPath));
+        void vscode.window.showInformationMessage(`Copilot CLI handoff ready for ${epic.key}. Command copied to clipboard.`);
+        return;
+      }
+
+      return {
+        mode: 'cli-handoff',
+        artifactPath: phase.artifactPath,
+        ...buildPhaseSessionResultMetadata(session),
+        verification: verificationEvidence.records,
+        preferredAgentStatus,
+        runPreferences,
+        rolePolicyResolution: executionResolution.rolePolicyResolution,
+        handoffPath: handoff.promptPath,
+        handoffCommand: handoff.command,
+      } satisfies PhaseCommandResult;
     }
 
     const shouldAttemptAgentLaunch = !options.forceChatFallback
@@ -995,13 +1117,12 @@ export function activate(context: vscode.ExtensionContext): void {
     const verificationEvidence = await attachVerificationEvidence(session, output, false);
     session = buildPhaseSessionContext(phase, epic, workspaceRoot);
     const executionResolution = getPhaseExecutionResolution(epic, phase);
-    const runPreferences = executionResolution.runPreferences;
-    const preferredAgentStatus = executionResolution.preferredAgentStatus;
+    const { runPreferences, preferredAgentStatus } = executionResolution;
     rememberPhaseSession(session);
     const artifactProposalPrompt = buildArtifactProposalPrompt(session);
     const contextFiles = buildTraceContextFiles(session);
     reportPreferredChatAgentStatus(session, preferredAgentStatus, output, false);
-    if (!await confirmRoleRouting(session, executionResolution.rolePolicyResolution, false)) {
+    if (!await confirmRoleRouting(executionResolution.rolePolicyResolution, false)) {
       return;
     }
     const proposal = await proposeArtifactUpdateWithCopilot(context, session, output, runPreferences.modelFamily);
@@ -1373,26 +1494,12 @@ function resolveAutopilotTarget(first: unknown, second?: EpicStatus): PhaseComma
 }
 
 function getPhaseCommandOptions(value: unknown): PhaseCommandOptions {
-  if (typeof value === 'object' && value !== null && 'nonInteractive' in value) {
-    return {
-      nonInteractive: (value as { nonInteractive?: unknown }).nonInteractive === true,
-      forceChatFallback: (value as { forceChatFallback?: unknown }).forceChatFallback === true,
-      autopilotExecutionMode: parseGuidedAutopilotExecutionMode((value as { autopilotExecutionMode?: unknown }).autopilotExecutionMode)
-        ?? resolveConfiguredGuidedAutopilotExecutionMode(),
-    };
-  }
-
-  return {
-    nonInteractive: false,
-    forceChatFallback: false,
-    autopilotExecutionMode: resolveConfiguredGuidedAutopilotExecutionMode(),
-  };
+  return parsePhaseCommandOptions(value, resolveConfiguredGuidedAutopilotExecutionMode());
 }
 
-function parseGuidedAutopilotExecutionMode(value: unknown): GuidedAutopilotExecutionMode | undefined {
-  return value === 'fully-automatic' || value === 'agent-pause'
-    ? value
-    : undefined;
+function resolveCopilotProvider(): CopilotProviderMode {
+  const value = vscode.workspace.getConfiguration('apexDelivery').get<unknown>('copilot.provider');
+  return value === 'copilotCliPrompt' ? 'copilotCliPrompt' : 'vscodeBuiltIn';
 }
 
 function resolveConfiguredGuidedAutopilotExecutionMode(): GuidedAutopilotExecutionMode {
@@ -1400,101 +1507,47 @@ function resolveConfiguredGuidedAutopilotExecutionMode(): GuidedAutopilotExecuti
     ?? 'agent-pause';
 }
 
-function getIntegratedFlowCommandOptions(value: unknown): IntegratedFlowCommandOptions {
-  if (typeof value === 'object' && value !== null) {
-    const candidate = value as {
-      nonInteractive?: unknown;
-      openSpec?: unknown;
-      title?: unknown;
-      source?: unknown;
-    };
-
-    return {
-      nonInteractive: candidate.nonInteractive === true,
-      openSpec: candidate.openSpec === true,
-      title: typeof candidate.title === 'string' ? candidate.title : undefined,
-      source: typeof candidate.source === 'string' ? candidate.source : undefined,
-    };
-  }
-
-  return {
-    nonInteractive: false,
-    openSpec: false,
-  };
-}
-
-function getCreateSampleEpicCommandOptions(value: unknown): CreateSampleEpicCommandOptions {
-  if (isRecord(value)) {
-    return {
-      nonInteractive: value.nonInteractive === true,
-      workflowId: typeof value.workflowId === 'string' ? value.workflowId : undefined,
-    };
-  }
-
-  return {
-    nonInteractive: false,
-  };
-}
-
-function getLinkBranchToEpicCommandOptions(value: unknown): LinkBranchToEpicCommandOptions {
-  if (!isRecord(value) || (!('nonInteractive' in value) && !('branchName' in value))) {
-    return {
-      nonInteractive: false,
-    };
-  }
-
-  return {
-    nonInteractive: value.nonInteractive === true,
-    branchName: typeof value.branchName === 'string' ? value.branchName : undefined,
-  };
-}
-
-function getOpenLinkedBranchWorktreeCommandOptions(value: unknown): OpenLinkedBranchWorktreeCommandOptions {
-  if (!isRecord(value) || (!('nonInteractive' in value) && !('branchName' in value) && !('openInNewWindow' in value))) {
-    return {
-      nonInteractive: false,
-      openInNewWindow: true,
-    };
-  }
-
-  return {
-    nonInteractive: value.nonInteractive === true,
-    branchName: typeof value.branchName === 'string' ? value.branchName : undefined,
-    openInNewWindow: typeof value.openInNewWindow === 'boolean' ? value.openInNewWindow : true,
-  };
-}
-
 function getPhaseRunPreferences(
   workflowId: string,
   phaseId: PhaseStatus['id'],
-  rolePolicyResolution?: RolePolicyResolution,
+  phaseOwner?: string,
   workflowDefaults?: PhaseStatus['sessionDefaults'],
 ): PhaseRunPreferences {
   const defaults = getWorkspacePhaseRunDefaults();
-  const override = getPhaseRunProfileOverride(workflowId, phaseId);
-  const roleDefaults = rolePolicyResolution?.preferences ?? {};
-
-  // AC2: explicit profile overrides win, then snapshotted workflow defaults, then role policies, then workspace defaults.
   return {
-    autoSubmit: override?.autoSubmit ?? workflowDefaults?.autoSubmit ?? roleDefaults.autoSubmit ?? defaults.autoSubmit,
-    agentTag: override?.agentTag ?? workflowDefaults?.agentTag ?? roleDefaults.agentTag ?? defaults.agentTag,
-    modelFamily: override?.modelFamily ?? workflowDefaults?.modelFamily ?? roleDefaults.modelFamily ?? defaults.modelFamily,
-    preferredChatAgent: override?.preferredChatAgent ?? workflowDefaults?.preferredChatAgent ?? roleDefaults.preferredChatAgent ?? defaults.preferredChatAgent,
-    starterPrompt: override?.starterPrompt ?? workflowDefaults?.starterPrompt ?? roleDefaults.starterPrompt ?? defaults.starterPrompt,
+    ...resolvePhaseRunPlan({
+      userRole: getCurrentUserRole(),
+      workflowId,
+      phaseId,
+      phaseOwner,
+      workflowDefaults,
+      workspaceDefaults: defaults,
+      rawRolePolicies: vscode.workspace.getConfiguration('apexDelivery').get<unknown>('runPhase.rolePolicies', {}),
+      rawPhaseProfiles: vscode.workspace.getConfiguration('apexDelivery').get<Record<string, unknown>>('runPhase.phaseProfiles', {}),
+    }).runPreferences,
+    modelFamily: undefined,
   };
 }
 
 function getPhaseExecutionResolution(epic: EpicStatus, phase: PhaseStatus): PhaseExecutionResolution {
-  const rolePolicyResolution = resolveRolePolicy(
-    phase.owner,
-    getCurrentUserRole(),
-    vscode.workspace.getConfiguration('apexDelivery').get<unknown>('runPhase.rolePolicies', {}),
-  );
-  const runPreferences = getPhaseRunPreferences(epic.workflowId, phase.id, rolePolicyResolution, phase.sessionDefaults);
+  const runPlan = resolvePhaseRunPlan({
+    userRole: getCurrentUserRole(),
+    workflowId: epic.workflowId,
+    phaseId: phase.id,
+    phaseOwner: phase.owner,
+    workflowDefaults: phase.sessionDefaults,
+    workspaceDefaults: getWorkspacePhaseRunDefaults(),
+    rawRolePolicies: vscode.workspace.getConfiguration('apexDelivery').get<unknown>('runPhase.rolePolicies', {}),
+    rawPhaseProfiles: vscode.workspace.getConfiguration('apexDelivery').get<Record<string, unknown>>('runPhase.phaseProfiles', {}),
+  });
+  const runPreferences: PhaseRunPreferences = {
+    ...runPlan.runPreferences,
+    modelFamily: undefined,
+  };
   return {
     runPreferences,
     preferredAgentStatus: resolvePreferredChatAgentStatus(runPreferences),
-    rolePolicyResolution,
+    rolePolicyResolution: runPlan.rolePolicyResolution,
   };
 }
 
@@ -1503,65 +1556,15 @@ function getWorkspacePhaseRunDefaults(): PhaseRunPreferences {
   return {
     autoSubmit: config.get<boolean>('runPhase.autoSubmit', true),
     agentTag: normalizeNonEmptyString(config.get<unknown>('runPhase.agentTag')),
-    modelFamily: normalizeNonEmptyString(config.get<unknown>('runPhase.modelFamily')),
     preferredChatAgent: normalizeNonEmptyString(config.get<unknown>('runPhase.preferredChatAgent')),
     starterPrompt: normalizeNonEmptyString(config.get<unknown>('runPhase.starterPrompt')),
+    starterPromptPlacement: normalizeStarterPromptPlacement(config.get<unknown>('runPhase.starterPromptPlacement')) ?? 'prepend',
+    modelFamily: undefined,
   };
 }
 
 function getCurrentUserRole(): string | undefined {
   return normalizeNonEmptyString(vscode.workspace.getConfiguration('apexDelivery').get<unknown>('userRole'));
-}
-
-function getPhaseRunProfileOverride(workflowId: string, phaseId: PhaseStatus['id']): PhaseRunProfileOverride | undefined {
-  const rawProfiles = vscode.workspace.getConfiguration('apexDelivery').get<Record<string, unknown>>('runPhase.phaseProfiles', {});
-  const workflowScopedOverride = readPhaseRunProfileOverrideFromScope(rawProfiles[workflowId], phaseId);
-  if (workflowScopedOverride) {
-    return workflowScopedOverride;
-  }
-
-  return parsePhaseRunProfileOverride(rawProfiles[phaseId]);
-}
-
-function readPhaseRunProfileOverrideFromScope(scope: unknown, phaseId: PhaseStatus['id']): PhaseRunProfileOverride | undefined {
-  if (!isRecord(scope)) {
-    return undefined;
-  }
-
-  return parsePhaseRunProfileOverride(scope[phaseId]);
-}
-
-function parsePhaseRunProfileOverride(rawOverride: unknown): PhaseRunProfileOverride | undefined {
-  if (!isRecord(rawOverride)) {
-    return undefined;
-  }
-
-  const override: PhaseRunProfileOverride = {};
-  if (typeof rawOverride.autoSubmit === 'boolean') {
-    override.autoSubmit = rawOverride.autoSubmit;
-  }
-
-  const agentTag = normalizeNonEmptyString(rawOverride.agentTag);
-  if (agentTag) {
-    override.agentTag = agentTag;
-  }
-
-  const modelFamily = normalizeNonEmptyString(rawOverride.modelFamily);
-  if (modelFamily) {
-    override.modelFamily = modelFamily;
-  }
-
-  const preferredChatAgent = normalizeNonEmptyString(rawOverride.preferredChatAgent);
-  if (preferredChatAgent) {
-    override.preferredChatAgent = preferredChatAgent;
-  }
-
-  const starterPrompt = normalizeNonEmptyString(rawOverride.starterPrompt);
-  if (starterPrompt) {
-    override.starterPrompt = starterPrompt;
-  }
-
-  return Object.keys(override).length > 0 ? override : undefined;
 }
 
 async function configurePhaseProfile(
@@ -1582,7 +1585,11 @@ async function configurePhaseProfile(
   }
 
   const defaults = getWorkspacePhaseRunDefaults();
-  const existingOverride = getPhaseRunProfileOverride(target.workflowId, target.id);
+  const existingOverride = resolvePhaseRunProfileOverride(
+    vscode.workspace.getConfiguration('apexDelivery').get<Record<string, unknown>>('runPhase.phaseProfiles', {}),
+    target.workflowId,
+    target.id,
+  );
   const nextOverride = await promptForPhaseRunProfile(target, defaults, existingOverride);
   if (!nextOverride) {
     return;
@@ -1613,7 +1620,7 @@ async function configurePhaseProfile(
     output.appendLine(`[Config] Saved run-phase profile for ${target.workflowId}/${target.id}: ${formatPhaseProfileLogValue(nextOverride)}`);
     const resolved = getPhaseRunPreferences(target.workflowId, target.id);
     void vscode.window.showInformationMessage(
-      `Saved ${target.workflowName} / ${target.name} profile. Preferred agent: ${resolved.preferredChatAgent ?? 'none'}; auto-submit: ${formatAutoSubmitLabel(resolved.autoSubmit)}; agent tag: ${resolved.agentTag ?? 'none'}; model family: ${resolved.modelFamily ?? 'none'}.`,
+      `Saved ${target.workflowName} / ${target.name} profile. Preferred agent: ${resolved.preferredChatAgent ?? 'none'}; auto-submit: ${formatAutoSubmitLabel(resolved.autoSubmit)}; agent tag: ${resolved.agentTag ?? 'none'}.`,
     );
   } catch (error: unknown) {
     const message = formatErrorMessage(error);
@@ -1793,64 +1800,6 @@ async function promptForPhaseRunProfile(
     preferredChatAgent = normalizeNonEmptyString(input);
   }
 
-  type ModelFamilyPick = vscode.QuickPickItem & { value: string | 'inherit' | 'custom' };
-  const commonModelFamilies = ['gpt-4.1', 'gpt-4o', 'gpt-4', 'o1'];
-  const currentModelFamily = existingOverride?.modelFamily;
-  const modelFamilySelection = await vscode.window.showQuickPick<ModelFamilyPick>(
-    [
-      {
-        label: 'Inherit workspace default',
-        description: defaults.modelFamily ?? 'No workspace model preference',
-        detail: 'Use the workspace-level model preference for direct execution or direct fallback.',
-        value: 'inherit',
-        picked: currentModelFamily === undefined,
-      },
-      ...commonModelFamilies.map((modelFamily) => ({
-        label: modelFamily,
-        description: 'Use this model family for direct execution paths owned by the extension.',
-        detail: 'Chat UI model selection still follows the active GitHub Copilot Chat session.',
-        value: modelFamily,
-        picked: currentModelFamily === modelFamily,
-      })),
-      {
-        label: 'Custom model family',
-        description: currentModelFamily && !commonModelFamilies.includes(currentModelFamily) ? currentModelFamily : 'Enter your own model family',
-        detail: 'Use this when your preferred family is not listed above.',
-        value: 'custom',
-        picked: currentModelFamily !== undefined && !commonModelFamilies.includes(currentModelFamily),
-      },
-    ],
-    {
-      title: `${target.workflowName} / ${target.name}: preferred model family`,
-      placeHolder: 'Choose the direct-execution model preference for this phase.',
-      ignoreFocusOut: true,
-    },
-  );
-  if (!modelFamilySelection) {
-    return undefined;
-  }
-
-  let modelFamily: string | undefined;
-  if (modelFamilySelection.value === 'custom') {
-    const input = await vscode.window.showInputBox({
-      title: `${target.workflowName} / ${target.name}: custom model family`,
-      prompt: 'Enter the preferred model family for direct execution paths in this phase.',
-      placeHolder: 'gpt-4.1',
-      value: currentModelFamily ?? defaults.modelFamily ?? 'gpt-4.1',
-      ignoreFocusOut: true,
-      validateInput: (value: string) => normalizeNonEmptyString(value)
-        ? null
-        : 'Model family cannot be empty. Choose inherit instead if this phase should not override it.',
-    });
-    if (input === undefined) {
-      return undefined;
-    }
-
-    modelFamily = normalizeNonEmptyString(input);
-  } else if (modelFamilySelection.value !== 'inherit') {
-    modelFamily = modelFamilySelection.value;
-  }
-
   const nextOverride: PhaseRunProfileOverride = {};
   if (autoSubmitSelection.value !== 'inherit') {
     nextOverride.autoSubmit = autoSubmitSelection.value;
@@ -1860,9 +1809,6 @@ async function promptForPhaseRunProfile(
   }
   if (preferredChatAgent !== undefined) {
     nextOverride.preferredChatAgent = preferredChatAgent;
-  }
-  if (modelFamily !== undefined) {
-    nextOverride.modelFamily = modelFamily;
   }
   if (existingOverride?.starterPrompt !== undefined) {
     nextOverride.starterPrompt = existingOverride.starterPrompt;
@@ -1894,11 +1840,8 @@ function buildPhaseProfileConfirmation(
   const preferredAgentSummary = nextOverride.preferredChatAgent === undefined
     ? `Inherit workspace default (${defaults.preferredChatAgent ?? 'none'})`
     : nextOverride.preferredChatAgent;
-  const modelFamilySummary = nextOverride.modelFamily === undefined
-    ? `Inherit workspace default (${defaults.modelFamily ?? 'none'})`
-    : nextOverride.modelFamily;
 
-  return `Save ${target.workflowName} / ${target.name} profile? Preferred agent: ${preferredAgentSummary}; auto-submit: ${autoSubmitSummary}; agent tag: ${agentTagSummary}; model family: ${modelFamilySummary}.`;
+  return `Save ${target.workflowName} / ${target.name} profile? Preferred agent: ${preferredAgentSummary}; auto-submit: ${autoSubmitSummary}; agent tag: ${agentTagSummary}.`;
 }
 
 function formatAutoSubmitLabel(value: boolean): string {
@@ -2378,6 +2321,13 @@ function buildPhaseSessionContext(
   workspaceRoot: string,
 ): PhaseSessionContext {
   const sessionKey = buildPhaseChatSessionKey(epic);
+  const referencePaths = isPbiDeliveryWorkflow(epic.workflowId)
+    ? listPbiReferencePaths(epic, phase)
+    : [
+      path.join(epic.folderPath, 'EPIC.md'),
+      phase.artifactPath,
+      phase.statusPath,
+    ];
   return {
     sessionId: sessionKey,
     sessionKey,
@@ -2387,11 +2337,7 @@ function buildPhaseSessionContext(
     phase,
     epic,
     workspaceRoot,
-    references: [
-      readContextFile('Epic brief', path.join(epic.folderPath, 'EPIC.md'), CONTEXT_LIMITS.epic),
-      readContextFile('Phase artifact', phase.artifactPath, CONTEXT_LIMITS.artifact),
-      readContextFile('Phase status', phase.statusPath, CONTEXT_LIMITS.status),
-    ],
+    references: referencePaths.map((filePath) => readContextFile(describePhaseReference(filePath, epic, phase), filePath, resolvePhaseReferenceLimit(filePath))),
   };
 }
 
@@ -2537,6 +2483,55 @@ function readContextFile(label: string, filePath: string, maxChars: number): Pha
   };
 }
 
+function describePhaseReference(filePath: string, epic: EpicStatus, phase: PhaseStatus): string {
+  const baseName = path.basename(filePath).toLowerCase();
+  if (baseName === 'epic.md') {
+    return 'Epic brief';
+  }
+  if (filePath === phase.artifactPath) {
+    return 'Phase artifact';
+  }
+  if (filePath === phase.statusPath) {
+    return 'Phase status';
+  }
+  if (baseName === 'pbi.md') {
+    return 'PBI intake';
+  }
+  if (baseName === 'investigation.md') {
+    return 'Investigation';
+  }
+  if (baseName === 'code-flow.md') {
+    return 'Code flow';
+  }
+  if (baseName === 'design-decision.md') {
+    return 'Design decision';
+  }
+  if (baseName === 'test-decision.md') {
+    return 'Test decision';
+  }
+  if (baseName === 'tdd-plan.md') {
+    return 'TDD plan';
+  }
+  if (baseName === 'pbi-review.md') {
+    return 'PBI review';
+  }
+  if (baseName === 'evidence.md') {
+    return 'Evidence pack';
+  }
+  return `${epic.key} context`;
+}
+
+function resolvePhaseReferenceLimit(filePath: string): number {
+  const baseName = path.basename(filePath).toLowerCase();
+  if (baseName === 'epic.md' || baseName === 'pbi.md') {
+    return CONTEXT_LIMITS.epic;
+  }
+  if (baseName.endsWith('.json')) {
+    return CONTEXT_LIMITS.status;
+  }
+  return CONTEXT_LIMITS.artifact;
+}
+
 function readStoredRunTraceHistory(context: vscode.ExtensionContext): PhaseRunTraceEntry[] {
   const stored = context.workspaceState.get<PhaseRunTraceEntry[]>(PHASE_RUN_TRACE_STORAGE_KEY, []);
   return Array.isArray(stored) ? stored : [];
@@ -2632,7 +2627,6 @@ function reportPreferredChatAgentStatus(
 }
 
 async function confirmRoleRouting(
-  session: PhaseSessionContext,
   rolePolicyResolution: RolePolicyResolution,
   nonInteractive: boolean,
 ): Promise<boolean> {
@@ -3523,49 +3517,21 @@ function buildPhaseSessionBrief(
 }
 
 function buildScopedChatStarter(session: PhaseSessionContext, runPreferences?: PhaseRunPreferences): string {
-  const epicPath = displayPath(session.workspaceRoot, path.join(session.epic.folderPath, 'EPIC.md'));
-  const artifactPath = displayPath(session.workspaceRoot, session.phase.artifactPath);
-  const statusPath = displayPath(session.workspaceRoot, session.phase.statusPath);
-  return [
-    buildPhaseChatSessionMarker(session),
-    runPreferences?.preferredChatAgent ? `Preferred GitHub Copilot Chat agent: ${runPreferences.preferredChatAgent}.` : undefined,
-    runPreferences?.agentTag ? `Continue with ${runPreferences.agentTag}.` : undefined,
-    runPreferences?.modelFamily ? `Preferred model family hint: ${runPreferences.modelFamily}. GitHub Copilot Chat still follows the active chat UI model selector.` : undefined,
-    `Continue the ${session.phase.name} phase for ${session.epic.key} (${session.epic.title}).`,
-    `Treat this as a dedicated conversation for ${session.epic.key} only. Ignore prior turns that refer to a different epic or a different APEX_SESSION marker.`,
-    `Keep the answer scoped to ${path.basename(session.phase.artifactPath)} and the current phase only.`,
-    `Use these files as the source of truth when they are attached or open: ${epicPath}, ${artifactPath}, ${statusPath}.`,
-    `When possible, update the existing artifact instead of drafting a separate scratch document.`,
-    'If source information is missing, list explicit open questions instead of inventing facts.',
-    runPreferences?.starterPrompt ? '' : undefined,
-    runPreferences?.starterPrompt ? 'Workflow-specific starter prompt:' : undefined,
-    runPreferences?.starterPrompt,
-  ].filter((line): line is string => typeof line === 'string').join('\n');
+  return renderScopedChatStarter(buildPhasePromptRenderContextFromSession(session), runPreferences);
 }
 
 function buildCopilotAgentStarter(session: PhaseSessionContext, runPreferences: PhaseRunPreferences): string {
-  return [
-    buildPhaseChatSessionMarker(session),
-    runPreferences.preferredChatAgent ? `Preferred GitHub Copilot Chat agent: ${runPreferences.preferredChatAgent}.` : undefined,
-    runPreferences.agentTag ? `Continue with ${runPreferences.agentTag}.` : undefined,
-    runPreferences.modelFamily ? `Preferred model family hint: ${runPreferences.modelFamily}. GitHub Copilot Chat still uses the active chat UI selection because the public chat-open API does not expose model locking.` : undefined,
-    `Update the attached phase artifact ${path.basename(session.phase.artifactPath)} for ${session.epic.key} (${session.epic.title}).`,
-    `Keep the work scoped to the ${session.phase.name} phase only.`,
-    `Treat this as a dedicated conversation for ${session.epic.key} only. Ignore prior turns that refer to a different epic or a different APEX_SESSION marker.`,
-    `Edit the existing artifact in place instead of creating a new untitled or side document.`,
-    `Use the attached epic brief and phase status as context, and leave explicit open questions where source information is missing.`,
-    runPreferences.starterPrompt ? '' : undefined,
-    runPreferences.starterPrompt ? 'Workflow-specific starter prompt:' : undefined,
-    runPreferences.starterPrompt,
-  ].filter((line): line is string => typeof line === 'string').join('\n');
+  return renderCopilotAgentStarter(buildPhasePromptRenderContextFromSession(session), runPreferences);
 }
 
 function buildPhaseChatAttachments(session: PhaseSessionContext): readonly vscode.Uri[] {
-  const candidatePaths = [
-    path.join(session.epic.folderPath, 'EPIC.md'),
-    session.phase.artifactPath,
-    session.phase.statusPath,
-  ];
+  const candidatePaths = isPbiDeliveryWorkflow(session.epic.workflowId)
+    ? listPbiReferencePaths(session.epic, session.phase)
+    : [
+      path.join(session.epic.folderPath, 'EPIC.md'),
+      session.phase.artifactPath,
+      session.phase.statusPath,
+    ];
 
   return candidatePaths
     .filter((candidatePath, index, allPaths) => fs.existsSync(candidatePath) && allPaths.indexOf(candidatePath) === index)
@@ -3573,31 +3539,52 @@ function buildPhaseChatAttachments(session: PhaseSessionContext): readonly vscod
 }
 
 function buildDirectModelPrompt(session: PhaseSessionContext, runPreferences?: PhaseRunPreferences): string {
-  const artifactPath = displayPath(session.workspaceRoot, session.phase.artifactPath);
-  const lines = [
-    'You are assisting one APEX delivery phase inside VS Code.',
-    'Stay scoped to this phase only. Do not change or speculate about unrelated phases.',
-    'Use only the provided source text and phase metadata as your source of truth.',
-    'Return markdown with these exact sections:',
-    '## Phase Assessment',
-    '## Recommended Artifact Updates',
-    '## Open Questions',
-    '## Next Action',
-    '',
-    `Epic: ${session.epic.key} - ${session.epic.title}`,
-    `Phase: ${session.phase.name} (${session.phase.id})`,
-    `Status: ${session.phase.status}`,
-    `Expected output: ${session.phase.output}`,
-    `Primary artifact: ${artifactPath}`,
-    runPreferences?.starterPrompt ? '' : undefined,
-    runPreferences?.starterPrompt ? 'Workflow-specific starter prompt:' : undefined,
-    runPreferences?.starterPrompt,
-    '',
-    'Source text:',
-    formatSessionReferences(session),
-  ];
+  return renderDirectModelPrompt({
+    ...buildPhasePromptRenderContextFromSession(session),
+    referenceText: formatSessionReferences(session),
+  }, runPreferences);
+}
 
-  return lines.filter((line): line is string => typeof line === 'string').join('\n');
+async function createCopilotCliPhaseHandoff(
+  session: PhaseSessionContext,
+  runPreferences: PhaseRunPreferences,
+  output: vscode.OutputChannel,
+): Promise<ReturnType<typeof buildCopilotCliHandoff>> {
+  const prompt = buildCopilotCliPrompt(session, runPreferences);
+  const handoff = buildCopilotCliHandoff(session.workspaceRoot, session.epic, session.phase, prompt);
+  await vscode.env.clipboard.writeText(handoff.command);
+  output.appendLine(`[Copilot] Copilot CLI handoff ready for ${session.epic.key} / ${session.phase.id}.`);
+  output.appendLine(`[Copilot] Prompt file: ${handoff.promptPath}`);
+  output.appendLine(`[Copilot] Command: ${handoff.command}`);
+  return handoff;
+}
+
+function buildCopilotCliPrompt(session: PhaseSessionContext, runPreferences: PhaseRunPreferences): string {
+  return renderCopilotCliPrompt({
+    ...buildPhasePromptRenderContextFromSession(session),
+    workspaceRootDisplayPath: session.workspaceRoot,
+    referenceText: formatSessionReferences(session),
+  }, buildDraftPhaseRunPreferences(runPreferences));
+}
+
+function buildPhasePromptRenderContextFromSession(session: PhaseSessionContext): PhasePromptRenderContext {
+  return {
+    sessionMarker: buildPhaseChatSessionMarker(session),
+    workspaceRootDisplayPath: session.workspaceRoot,
+    epicDisplayPath: displayPath(session.workspaceRoot, path.join(session.epic.folderPath, 'EPIC.md')),
+    artifactDisplayPath: displayPath(session.workspaceRoot, session.phase.artifactPath),
+    artifactBasename: path.basename(session.phase.artifactPath),
+    statusDisplayPath: displayPath(session.workspaceRoot, session.phase.statusPath),
+    epicKey: session.epic.key,
+    epicTitle: session.epic.title,
+    workflowId: session.epic.workflowId,
+    phaseId: session.phase.id,
+    phaseName: session.phase.name,
+    phaseStatus: session.phase.status,
+    phaseOutput: session.phase.output,
+    branchNames: session.epic.coordination?.branches.map((branch) => branch.name) ?? [],
+    pullRequestCount: session.epic.coordination?.pullRequests.length ?? 0,
+  };
 }
 
 function buildArtifactProposalPrompt(session: PhaseSessionContext): string {
@@ -3719,23 +3706,29 @@ function updateStatusBar(
   currentBranchContext: CurrentBranchEpicContext,
 ): void {
   if (currentBranchContext.error) {
+    statusBar.command = 'apexDelivery.manageCurrentBranchBinding';
     statusBar.text = '$(warning) APEX Branch Link';
-    statusBar.tooltip = currentBranchContext.error;
+    statusBar.tooltip = `${currentBranchContext.error} Click to manage the current branch binding.`;
     statusBar.show();
     return;
   }
 
   if (currentBranchContext.epic) {
+    statusBar.command = 'apexDelivery.manageCurrentBranchBinding';
     const phaseLabel = currentBranchContext.phase?.name ?? 'Complete';
-    statusBar.text = `$(git-branch) ${currentBranchContext.epic.key} · ${phaseLabel}`;
+    const linkedBranchCount = currentBranchContext.epic.coordination?.branches.length ?? 0;
+    statusBar.text = linkedBranchCount > 1
+      ? `$(git-branch) ${currentBranchContext.epic.key} · ${phaseLabel} · ${linkedBranchCount} branches`
+      : `$(git-branch) ${currentBranchContext.epic.key} · ${phaseLabel}`;
     statusBar.tooltip = currentBranchContext.branchName
-      ? `Current branch "${currentBranchContext.branchName}" is linked to ${currentBranchContext.epic.key}. Click to open the APEX Delivery dashboard.`
-      : `Current epic ${currentBranchContext.epic.key}. Click to open the APEX Delivery dashboard.`;
+      ? `Current branch "${currentBranchContext.branchName}" is bound to ${currentBranchContext.epic.key}. Linked branches: ${currentBranchContext.epic.coordination?.branches.map((branch) => branch.name).join(', ') || 'none'}. Click to manage this binding.`
+      : `Current epic ${currentBranchContext.epic.key}. Click to manage the current branch binding.`;
     statusBar.show();
     return;
   }
 
   if (epics.length === 0) {
+    statusBar.command = 'apexDelivery.openDashboard';
     statusBar.text = '$(rocket) APEX Delivery';
     statusBar.tooltip = 'No delivery epics found. Open the dashboard or create a sample epic.';
     statusBar.show();
@@ -3745,14 +3738,16 @@ function updateStatusBar(
   const active = epics.filter((epic) => epic.progress > 0 && epic.progress < 100).length;
   const blocked = epics.filter((epic) => epic.hasBlocked).length;
   if (currentBranchContext.branchName) {
+    statusBar.command = 'apexDelivery.manageCurrentBranchBinding';
     statusBar.text = blocked > 0
       ? `$(git-branch) Unlinked · ${active} active · ${blocked} blocked`
       : `$(git-branch) Unlinked · ${active} active`;
-    statusBar.tooltip = `Current branch "${currentBranchContext.branchName}" is not linked to an epic. Run APEX: Link Current Branch To Epic or open the dashboard.`;
+    statusBar.tooltip = `Current branch "${currentBranchContext.branchName}" is not bound to an epic. Click to bind or manage the current branch.`;
     statusBar.show();
     return;
   }
 
+  statusBar.command = 'apexDelivery.openDashboard';
   statusBar.text = blocked > 0
     ? `$(warning) ${active} active · ${blocked} blocked`
     : `$(rocket) ${active} active epic${active === 1 ? '' : 's'}`;
@@ -3806,13 +3801,13 @@ function buildMissingCommandTargetMessage(
 
   if (currentBranchContext.branchName) {
     return kind === 'phase'
-      ? `Current branch "${currentBranchContext.branchName}" is not linked to an epic. Select a delivery phase or run APEX: Link Current Branch To Epic.`
-      : `Current branch "${currentBranchContext.branchName}" is not linked to an epic. Select a delivery phase or epic, or run APEX: Link Current Branch To Epic.`;
+      ? `Current branch "${currentBranchContext.branchName}" is not bound to an epic. Select a delivery phase or run APEX: Bind Branch To Epic.`
+      : `Current branch "${currentBranchContext.branchName}" is not bound to an epic. Select a delivery phase or epic, or run APEX: Bind Branch To Epic.`;
   }
 
   return kind === 'phase'
-    ? 'Select a delivery phase first, or run APEX: Link Current Branch To Epic.'
-    : 'Select a delivery phase or epic first, or run APEX: Link Current Branch To Epic.';
+    ? 'Select a delivery phase first, or run APEX: Bind Branch To Epic.'
+    : 'Select a delivery phase or epic first, or run APEX: Bind Branch To Epic.';
 }
 
 function resolveEpicCommandTarget(first: unknown, second?: EpicStatus): EpicStatus | undefined {
@@ -3832,19 +3827,26 @@ function isEpicItemLike(value: unknown): value is { epic: EpicStatus } {
     && isEpicStatusLike((value as { epic?: unknown }).epic);
 }
 
-async function pickEpicForBranchLink(epics: readonly EpicStatus[], branchName: string): Promise<EpicStatus | undefined> {
+async function pickEpicForBranchLink(
+  epics: readonly EpicStatus[],
+  branchName: string,
+  options?: {
+    title?: string;
+    placeHolder?: string;
+  },
+): Promise<EpicStatus | undefined> {
   const selection = await vscode.window.showQuickPick(
-    epics.map((epic) => ({
+    [...epics]
+      .sort((left, right) => scoreEpicBranchLinkFit(right, branchName) - scoreEpicBranchLinkFit(left, branchName))
+      .map((epic) => ({
       label: epic.key,
       description: epic.title,
-      detail: epic.coordination?.branches.some((branch) => branch.name === branchName)
-        ? `Already linked to ${branchName}`
-        : `Current phase: ${epic.phases[epic.currentPhaseIndex]?.name ?? 'Complete'}`,
+      detail: buildEpicBranchLinkDetail(epic, branchName),
       epic,
     })),
     {
-      title: 'Link Current Branch To Epic',
-      placeHolder: `Choose an epic for branch "${branchName}".`,
+      title: options?.title ?? 'Bind Branch To Epic',
+      placeHolder: options?.placeHolder ?? `Choose an epic for branch "${branchName}".`,
     },
   );
 
@@ -3963,7 +3965,6 @@ async function resolveEpicExecutionBranch(
 }
 
 function reportEpicExecutionIssue(
-  workspaceRoot: string,
   output: vscode.OutputChannel,
   epic: EpicStatus,
   resolution: Exclude<EpicExecutionBranchResolution, { status: 'resolved' | 'cancelled' }>,
@@ -3978,11 +3979,11 @@ function reportEpicExecutionIssue(
 
   let message = '';
   if (resolution.status === 'unlinked') {
-    message = `APEX blocked ${commandLabel} for ${epic.key}. No linked branch is configured. Next action: link a branch to ${epic.key} first.`;
+    message = `APEX blocked ${commandLabel} for ${epic.key}. No bound branch is configured. Next action: bind a branch to ${epic.key} first.`;
   } else if (resolution.status === 'invalid-explicit') {
     message = `APEX blocked ${commandLabel} for ${epic.key}. Branch "${resolution.explicitBranchName}" is not linked to this epic. Linked branches: ${resolution.linkedBranches.join(', ')}. Next action: choose one of the linked branches.`;
   } else {
-    message = `APEX blocked ${commandLabel} for ${epic.key}. Linked branches: ${resolution.linkedBranches.join(', ')}. ${currentBranchLabel} Next action: choose a linked branch or run APEX: Open Linked Branch Worktree.`;
+    message = `APEX blocked ${commandLabel} for ${epic.key}. Linked branches: ${resolution.linkedBranches.join(', ')}. ${currentBranchLabel} Next action: choose a linked branch or run APEX: Open Pinned Branch Workspace.`;
   }
 
   output.appendLine(`[Execution] ${message}`);
@@ -4002,7 +4003,7 @@ function reportEpicExecutionMismatch(
     : currentBranchResult.error
       ? `Current branch could not be resolved: ${currentBranchResult.error}.`
       : 'Current branch is unavailable in this workspace.';
-  const message = `APEX blocked ${commandLabel} for ${epic.key}. Expected linked branch "${expectedBranch}". ${currentBranchLabel} Next action: check out "${expectedBranch}" in this workspace or run APEX: Open Linked Branch Worktree first.`;
+  const message = `APEX blocked ${commandLabel} for ${epic.key}. Expected linked branch "${expectedBranch}". ${currentBranchLabel} Next action: check out "${expectedBranch}" in this workspace or run APEX: Open Pinned Branch Workspace first.`;
   output.appendLine(`[Execution] ${message}`);
   void vscode.window.showWarningMessage(message);
   return message;
@@ -4059,7 +4060,7 @@ async function ensureEpicExecutionBranchMatch(
   return {
     allowed: false,
     currentBranchName: currentBranchResult.branchName,
-    blockedReason: reportEpicExecutionIssue(workspaceRoot, output, epic, resolution, currentBranchResult, commandLabel),
+    blockedReason: reportEpicExecutionIssue(output, epic, resolution, currentBranchResult, commandLabel),
   };
 }
 
@@ -4072,18 +4073,212 @@ function remapWorkspacePath(sourceRoot: string, targetRoot: string, filePath: st
   return path.join(targetRoot, path.relative(sourceRoot, filePath));
 }
 
-async function pickBranchForLink(branches: readonly string[]): Promise<string | undefined> {
+async function pickBranchForLink(
+  branches: readonly string[],
+  title = 'Bind Branch To Epic',
+  placeHolder = 'Choose a local branch to bind to an epic.',
+): Promise<string | undefined> {
   const selection = await vscode.window.showQuickPick(
     [...branches].sort((left, right) => left.localeCompare(right)).map((branchName) => ({
       label: branchName,
     })),
     {
-      title: 'Link Branch To Epic',
-      placeHolder: 'Choose a local branch to link to an epic.',
+      title,
+      placeHolder,
     },
   );
 
   return selection?.label;
+}
+
+async function resolveBranchForBinding(
+  workspaceRoot: string,
+  gitService: GitService,
+  options: ReturnType<typeof getBindBranchToEpicCommandOptions>,
+): Promise<string | undefined> {
+  const explicitBranchName = options.branchName?.trim();
+  if (explicitBranchName) {
+    return explicitBranchName;
+  }
+
+  const currentBranchResult = gitService.getCurrentBranch(workspaceRoot);
+  if (options.useCurrentBranch) {
+    if (currentBranchResult.branchName) {
+      return currentBranchResult.branchName;
+    }
+    void vscode.window.showWarningMessage(currentBranchResult.error ?? 'Current Git branch could not be resolved.');
+    return undefined;
+  }
+
+  if (options.nonInteractive) {
+    if (currentBranchResult.branchName) {
+      return currentBranchResult.branchName;
+    }
+    void vscode.window.showWarningMessage('Provide a branch name when running Bind Branch To Epic non-interactively.');
+    return undefined;
+  }
+
+  const branches = gitService.listLocalBranches(workspaceRoot);
+  if (branches.length === 0) {
+    void vscode.window.showWarningMessage('No local Git branches were found to bind.');
+    return undefined;
+  }
+
+  const currentBranchName = currentBranchResult.branchName;
+  if (currentBranchName) {
+    const currentBranchChoice = await vscode.window.showQuickPick(
+      [
+        {
+          label: `Use Current Branch`,
+          description: currentBranchName,
+          value: 'current',
+        },
+        {
+          label: 'Choose Another Local Branch',
+          description: `${Math.max(branches.length - 1, 0)} other branch${branches.length === 2 ? '' : 'es'}`,
+          value: 'other',
+        },
+      ],
+      {
+        title: 'Bind Branch To Epic',
+        placeHolder: 'Choose which branch should be bound.',
+      },
+    );
+    if (!currentBranchChoice) {
+      return undefined;
+    }
+    if (currentBranchChoice.value === 'current') {
+      return currentBranchName;
+    }
+  }
+
+  return pickBranchForLink(branches);
+}
+
+async function bindBranchToEpicCommand(
+  epics: readonly EpicStatus[],
+  workspaceRoot: string,
+  gitService: GitService,
+  first: unknown,
+  second: EpicStatus | undefined,
+  output: vscode.OutputChannel,
+): Promise<boolean> {
+  const options = getBindBranchToEpicCommandOptions(first);
+  const branchName = await resolveBranchForBinding(workspaceRoot, gitService, options);
+  if (!branchName) {
+    return false;
+  }
+
+  const selectedEpic = resolveLatestEpicState(epics, resolveEpicCommandTarget(first, second));
+  const linkedEpic = epics.find((epic) => epic.coordination?.branches.some((branch) => branch.name === branchName));
+  if (linkedEpic && selectedEpic?.key === linkedEpic.key) {
+    if (options.openPinnedWorkspace) {
+      await vscode.commands.executeCommand('apexDelivery.openLinkedBranchWorktree', {
+        nonInteractive: true,
+        branchName,
+      }, selectedEpic);
+      return true;
+    }
+    void vscode.window.showInformationMessage(`Branch "${branchName}" is already bound to ${linkedEpic.key}.`);
+    return true;
+  }
+
+  const linked = await linkBranchToEpic(
+    epics,
+    branchName,
+    options,
+    selectedEpic,
+    output,
+    linkedEpic || branchName === gitService.getCurrentBranch(workspaceRoot).branchName ? 'current' : 'selected',
+  );
+  if (!linked) {
+    return false;
+  }
+
+  if (options.openPinnedWorkspace) {
+    await vscode.commands.executeCommand('apexDelivery.openLinkedBranchWorktree', {
+      nonInteractive: true,
+      branchName,
+    }, selectedEpic);
+  }
+
+  return true;
+}
+
+async function manageCurrentBranchBindingCommand(
+  epics: readonly EpicStatus[],
+  workspaceRoot: string,
+  gitService: GitService,
+  output: vscode.OutputChannel,
+): Promise<boolean> {
+  const branchResult = gitService.getCurrentBranch(workspaceRoot);
+  if (!branchResult.branchName) {
+    void vscode.window.showWarningMessage(branchResult.error ?? 'Current Git branch could not be resolved.');
+    return false;
+  }
+
+  const branchName = branchResult.branchName;
+  const linkedEpics = epics.filter((epic) => epic.coordination?.branches.some((branch) => branch.name === branchName));
+  if (linkedEpics.length > 1) {
+    void vscode.window.showWarningMessage(`Current branch "${branchName}" is linked to multiple epics. Inspect the bindings and clean them up first.`);
+    await inspectEpicBranchBindingsCommand(linkedEpics, linkedEpics[0], undefined, output);
+    return false;
+  }
+
+  const linkedEpic = linkedEpics[0];
+  if (!linkedEpic) {
+    const action = await vscode.window.showQuickPick(
+      [
+        { label: 'Bind Current Branch To Epic', value: 'bind', detail: `Bind "${branchName}" to a delivery epic.` },
+        { label: 'Open Dashboard', value: 'dashboard', detail: 'Open the APEX dashboard instead.' },
+      ],
+      {
+        title: `Current Branch: ${branchName}`,
+        placeHolder: 'This branch is not bound to an epic yet.',
+      },
+    );
+    if (!action) {
+      return false;
+    }
+    if (action.value === 'dashboard') {
+      await vscode.commands.executeCommand('apexDelivery.openDashboard');
+      return false;
+    }
+    return bindBranchToEpicCommand(epics, workspaceRoot, gitService, { useCurrentBranch: true }, undefined, output);
+  }
+
+  const action = await vscode.window.showQuickPick(
+    [
+      { label: 'Open Pinned Workspace', value: 'open', detail: `Open the pinned workspace for ${branchName}.` },
+      { label: 'Rebind To Another Epic', value: 'move', detail: `Move "${branchName}" from ${linkedEpic.key} to another epic.` },
+      { label: 'Unlink From Epic', value: 'unlink', detail: `Remove "${branchName}" from ${linkedEpic.key}.` },
+      { label: 'Open Linked Epic', value: 'epic', detail: `${linkedEpic.key} - ${linkedEpic.title}` },
+    ],
+    {
+      title: `Manage Current Branch Binding`,
+      placeHolder: `${branchName} is currently bound to ${linkedEpic.key}.`,
+    },
+  );
+  if (!action) {
+    return false;
+  }
+
+  if (action.value === 'open') {
+    await vscode.commands.executeCommand('apexDelivery.openLinkedBranchWorktree', {
+      nonInteractive: true,
+      branchName,
+    }, linkedEpic);
+    return true;
+  }
+  if (action.value === 'move') {
+    return moveBranchToEpicCommand(epics, linkedEpic, undefined, output);
+  }
+  if (action.value === 'unlink') {
+    return unlinkBranchFromEpicCommand(epics, linkedEpic, undefined, output);
+  }
+
+  await vscode.commands.executeCommand('vscode.open', vscode.Uri.file(path.join(linkedEpic.folderPath, 'EPIC.md')));
+  return false;
 }
 
 async function linkBranchToEpic(
@@ -4094,18 +4289,41 @@ async function linkBranchToEpic(
   output: vscode.OutputChannel,
   source: 'current' | 'selected',
 ): Promise<boolean> {
-  const selectedEpic = resolveLatestEpicState(epics, resolveEpicCommandTarget(first, second)) ?? await pickEpicForBranchLink(epics, branchName);
+  const selectedEpic = resolveLatestEpicState(epics, resolveEpicCommandTarget(first, second)) ?? await pickEpicForBranchLink(epics, branchName, {
+    title: 'Bind Branch To Epic',
+    placeHolder: `Choose an epic for branch "${branchName}".`,
+  });
   if (!selectedEpic) {
     return false;
+  }
+
+  if (selectedEpic.coordination?.branches.some((branch) => branch.name === branchName)) {
+    output.appendLine(`[Coordination] Branch ${branchName} is already linked to ${selectedEpic.key}.`);
+    return true;
   }
 
   const conflictingEpic = findBranchBindingConflict(epics, branchName, selectedEpic.key);
   if (conflictingEpic) {
     const branchLabel = source === 'current' ? 'Current branch' : 'Branch';
-    void vscode.window.showErrorMessage(
-      `${branchLabel} "${branchName}" is already linked to active epic ${conflictingEpic.key}. Remove the conflicting binding before linking it to ${selectedEpic.key}.`,
+    const conflictChoice = await vscode.window.showWarningMessage(
+      `${branchLabel} "${branchName}" is already bound to active epic ${conflictingEpic.key}.`,
+      'Move To Selected Epic',
+      'Open Linked Epic',
+      'Cancel',
     );
-    return false;
+    if (conflictChoice === 'Open Linked Epic') {
+      await vscode.commands.executeCommand('vscode.open', vscode.Uri.file(path.join(conflictingEpic.folderPath, 'EPIC.md')));
+      return false;
+    }
+    if (conflictChoice !== 'Move To Selected Epic') {
+      return false;
+    }
+
+    const moved = moveBranchBinding(conflictingEpic, selectedEpic, branchName, output);
+    if (moved) {
+      void vscode.window.showInformationMessage(`Moved branch "${branchName}" from ${conflictingEpic.key} to ${selectedEpic.key}.`);
+    }
+    return moved;
   }
 
   const metadataResult = readCoordinationMetadata(selectedEpic.folderPath);
@@ -4127,8 +4345,8 @@ async function linkBranchToEpic(
     },
   );
   writeCoordinationMetadata(selectedEpic.folderPath, metadata, metadataResult.raw);
-  output.appendLine(`[Coordination] Linked branch ${branchName} to ${selectedEpic.key}.`);
-  void vscode.window.showInformationMessage(`Linked branch "${branchName}" to ${selectedEpic.key}.`);
+  output.appendLine(`[Coordination] Bound branch ${branchName} to ${selectedEpic.key}.`);
+  void vscode.window.showInformationMessage(`Bound branch "${branchName}" to ${selectedEpic.key}.`);
   return true;
 }
 
@@ -4140,6 +4358,240 @@ function findBranchBindingConflict(
   return epics.find((epic) => epic.key !== targetEpicKey
     && epic.progress < 100
     && epic.coordination?.branches.some((branch) => branch.name === branchName));
+}
+
+async function unlinkBranchFromEpicCommand(
+  epics: readonly EpicStatus[],
+  first: unknown,
+  second: EpicStatus | undefined,
+  output: vscode.OutputChannel,
+): Promise<boolean> {
+  const targetEpic = resolveLatestEpicState(epics, resolveEpicCommandTarget(first, second)) ?? await pickEpicForCommand(
+    epics.filter((epic) => (epic.coordination?.branches.length ?? 0) > 0),
+    'Unlink Branch From Epic',
+    'Choose an epic whose branch binding should be removed.',
+  );
+  if (!targetEpic) {
+    return false;
+  }
+
+  const branchName = await pickLinkedBranchForEpic(
+    targetEpic,
+    getLinkedBranchNames(targetEpic),
+    'Unlink Branch From Epic',
+    `Choose a linked branch to remove from ${targetEpic.key}.`,
+    undefined,
+  );
+  if (!branchName) {
+    return false;
+  }
+
+  const confirmation = await vscode.window.showWarningMessage(
+    `Remove linked branch "${branchName}" from ${targetEpic.key}?`,
+    { modal: true },
+    'Unlink Branch',
+  );
+  if (confirmation !== 'Unlink Branch') {
+    return false;
+  }
+
+  unlinkBranchBinding(targetEpic, branchName, output);
+  void vscode.window.showInformationMessage(`Removed branch "${branchName}" from ${targetEpic.key}.`);
+  return true;
+}
+
+async function moveBranchToEpicCommand(
+  epics: readonly EpicStatus[],
+  first: unknown,
+  second: EpicStatus | undefined,
+  output: vscode.OutputChannel,
+): Promise<boolean> {
+  const sourceEpic = resolveLatestEpicState(epics, resolveEpicCommandTarget(first, second)) ?? await pickEpicForCommand(
+    epics.filter((epic) => (epic.coordination?.branches.length ?? 0) > 0),
+    'Move Branch To Epic',
+    'Choose the source epic whose branch binding should move.',
+  );
+  if (!sourceEpic) {
+    return false;
+  }
+
+  const branchName = await pickLinkedBranchForEpic(
+    sourceEpic,
+    getLinkedBranchNames(sourceEpic),
+    'Move Branch To Epic',
+    `Choose the linked branch to move from ${sourceEpic.key}.`,
+    undefined,
+  );
+  if (!branchName) {
+    return false;
+  }
+
+  const candidateEpics = epics.filter((epic) => epic.key !== sourceEpic.key);
+  const targetEpic = await pickEpicForBranchLink(candidateEpics, branchName, {
+    title: 'Move Branch To Epic',
+    placeHolder: `Choose the destination epic for branch "${branchName}".`,
+  });
+  if (!targetEpic) {
+    return false;
+  }
+
+  const confirmation = await vscode.window.showWarningMessage(
+    `Move branch "${branchName}" from ${sourceEpic.key} to ${targetEpic.key}?`,
+    { modal: true },
+    'Move Branch',
+  );
+  if (confirmation !== 'Move Branch') {
+    return false;
+  }
+
+  moveBranchBinding(sourceEpic, targetEpic, branchName, output);
+  void vscode.window.showInformationMessage(`Moved branch "${branchName}" from ${sourceEpic.key} to ${targetEpic.key}.`);
+  return true;
+}
+
+async function inspectEpicBranchBindingsCommand(
+  epics: readonly EpicStatus[],
+  first: unknown,
+  second: EpicStatus | undefined,
+  output: vscode.OutputChannel,
+): Promise<void> {
+  const targetEpic = resolveLatestEpicState(epics, resolveEpicCommandTarget(first, second)) ?? await pickEpicForCommand(
+    epics,
+    'Inspect Epic Branch Bindings',
+    'Choose an epic to inspect branch bindings.',
+  );
+  if (!targetEpic) {
+    return;
+  }
+
+  const branches = targetEpic.coordination?.branches ?? [];
+  if (branches.length === 0) {
+    void vscode.window.showInformationMessage(`${targetEpic.key} has no linked branches.`);
+    return;
+  }
+
+  const selection = await vscode.window.showQuickPick(
+    branches.map((branch) => ({
+      label: branch.name,
+      description: branch.role ?? 'implementation',
+      detail: `Linked at ${branch.linkedAt ?? 'unknown'}${branch.baseBranch ? ` · base ${branch.baseBranch}` : ''}`,
+      branch,
+    })),
+    {
+      title: `Branch bindings for ${targetEpic.key}`,
+      placeHolder: 'Inspect current branch bindings for this epic.',
+    },
+  );
+  if (!selection) {
+    return;
+  }
+
+  const action = await vscode.window.showQuickPick(
+    [
+      { label: 'Open Pinned Workspace', value: 'open' },
+      { label: 'Unlink Branch', value: 'unlink' },
+      { label: 'Move Branch To Another Epic', value: 'move' },
+    ],
+    {
+      title: `${targetEpic.key} · ${selection.branch.name}`,
+      placeHolder: 'Choose what to do with this branch binding.',
+    },
+  );
+  if (!action) {
+    return;
+  }
+
+  if (action.value === 'open') {
+    await vscode.commands.executeCommand('apexDelivery.openLinkedBranchWorktree', {
+      nonInteractive: true,
+      branchName: selection.branch.name,
+    }, targetEpic);
+    return;
+  }
+
+  if (action.value === 'unlink') {
+    await unlinkBranchFromEpicCommand(epics, targetEpic, undefined, output);
+    return;
+  }
+
+  await moveBranchToEpicCommand(epics, targetEpic, undefined, output);
+}
+
+function moveBranchBinding(
+  sourceEpic: EpicStatus,
+  targetEpic: EpicStatus,
+  branchName: string,
+  output: vscode.OutputChannel,
+): boolean {
+  const sourceMetadataResult = readCoordinationMetadata(sourceEpic.folderPath);
+  const targetMetadataResult = readCoordinationMetadata(targetEpic.folderPath);
+  if (sourceMetadataResult.error || targetMetadataResult.error) {
+    void vscode.window.showErrorMessage(sourceMetadataResult.error ?? targetMetadataResult.error ?? 'Unable to move branch binding.');
+    return false;
+  }
+
+  const sourceMetadata = sourceMetadataResult.metadata ?? createDefaultCoordinationMetadata(sourceEpic.key);
+  const targetMetadata = targetMetadataResult.metadata ?? createDefaultCoordinationMetadata(targetEpic.key);
+  const existingBinding = sourceMetadata.branches.find((branch) => branch.name === branchName);
+  if (!existingBinding) {
+    void vscode.window.showWarningMessage(`Branch "${branchName}" is not linked to ${sourceEpic.key}.`);
+    return false;
+  }
+
+  writeCoordinationMetadata(sourceEpic.folderPath, withoutBranchBinding(sourceMetadata, branchName), sourceMetadataResult.raw);
+  writeCoordinationMetadata(
+    targetEpic.folderPath,
+    withBranchBinding(targetMetadata, {
+      ...existingBinding,
+      linkedAt: new Date().toISOString(),
+    }),
+    targetMetadataResult.raw,
+  );
+  output.appendLine(`[Coordination] Moved branch ${branchName} from ${sourceEpic.key} to ${targetEpic.key}.`);
+  return true;
+}
+
+function unlinkBranchBinding(epic: EpicStatus, branchName: string, output: vscode.OutputChannel): boolean {
+  const metadataResult = readCoordinationMetadata(epic.folderPath);
+  if (metadataResult.error) {
+    void vscode.window.showErrorMessage(`Cannot update coordination metadata for ${epic.key}: ${metadataResult.error}`);
+    return false;
+  }
+
+  const metadata = metadataResult.metadata ?? createDefaultCoordinationMetadata(epic.key);
+  writeCoordinationMetadata(epic.folderPath, withoutBranchBinding(metadata, branchName), metadataResult.raw);
+  output.appendLine(`[Coordination] Removed branch ${branchName} from ${epic.key}.`);
+  return true;
+}
+
+function buildEpicBranchLinkDetail(epic: EpicStatus, branchName: string): string {
+  const owner = epic.coordination?.owner ? `Owner: ${epic.coordination.owner}` : 'Owner: none';
+  const currentPhase = epic.phases[epic.currentPhaseIndex]?.name ?? 'Complete';
+  const linkedBranches = epic.coordination?.branches.length ?? 0;
+  const branchStatus = epic.coordination?.branches.some((branch) => branch.name === branchName)
+    ? `already linked to ${branchName}`
+    : linkedBranches === 0
+      ? 'no linked branches yet'
+      : `${linkedBranches} linked branch${linkedBranches === 1 ? '' : 'es'}`;
+  return `${owner} · Phase: ${currentPhase} · ${branchStatus}`;
+}
+
+function scoreEpicBranchLinkFit(epic: EpicStatus, branchName: string): number {
+  let score = 0;
+  const normalizedBranchName = branchName.toLowerCase();
+  if ((epic.coordination?.branches.length ?? 0) === 0) {
+    score += 8;
+  }
+  if (normalizedBranchName.includes(epic.key.toLowerCase())) {
+    score += 20;
+  }
+  if (epic.title.toLowerCase().split(/\s+/).some((token) => token.length >= 4 && normalizedBranchName.includes(token))) {
+    score += 10;
+  }
+  if (epic.progress > 0 && epic.progress < 100) {
+    score += 5;
+  }
+  return score;
 }
 
 async function reviewPullRequestCommand(
@@ -4198,7 +4650,7 @@ async function reviewPullRequestCommand(
     }
 
     if (reviewBranchResolution.status !== 'resolved') {
-      const blockedReason = reportEpicExecutionIssue(workspaceRoot, output, linkedEpic, reviewBranchResolution, gitService.getCurrentBranch(workspaceRoot), 'Review Pull Request');
+      const blockedReason = reportEpicExecutionIssue(output, linkedEpic, reviewBranchResolution, gitService.getCurrentBranch(workspaceRoot), 'Review Pull Request');
       return {
         mode: 'blocked',
         linkedEpicKey: linkedEpic.key,
@@ -4220,7 +4672,7 @@ async function reviewPullRequestCommand(
     headBranch = resolvedReviewBranchName;
     const linkedWorktree = gitService.findWorktreeForBranch(workspaceRoot, resolvedReviewBranchName);
     if (!linkedWorktree) {
-      const blockedReason = `APEX blocked Review Pull Request for ${linkedEpic.key}. Expected linked branch "${resolvedReviewBranchName}" and a local worktree for that branch. Current branch "${currentBranchContext.branchName ?? 'unknown'}". Next action: run APEX: Open Linked Branch Worktree first.`;
+      const blockedReason = `APEX blocked Review Pull Request for ${linkedEpic.key}. Expected linked branch "${resolvedReviewBranchName}" and a local pinned branch workspace for that branch. Current branch "${currentBranchContext.branchName ?? 'unknown'}". Next action: run APEX: Open Pinned Branch Workspace first.`;
       output.appendLine(`[PR Review] ${blockedReason}`);
       void vscode.window.showWarningMessage(blockedReason);
       return {
@@ -4306,45 +4758,6 @@ async function reviewPullRequestCommand(
   };
 }
 
-function getReviewPullRequestCommandOptions(value: unknown): ReviewPullRequestCommandOptions {
-  if (typeof value !== 'object' || value === null) {
-    return {
-      nonInteractive: false,
-      openArtifact: true,
-    };
-  }
-
-  const candidate = value as Record<string, unknown>;
-  if (!('nonInteractive' in candidate)
-    && !('prInput' in candidate)
-    && !('prNumber' in candidate)
-    && !('prUrl' in candidate)
-    && !('baseBranch' in candidate)
-    && !('headBranch' in candidate)
-    && !('linkedEpicKey' in candidate)
-    && !('openArtifact' in candidate)
-  ) {
-    return {
-      nonInteractive: false,
-      openArtifact: true,
-    };
-  }
-
-  return {
-    nonInteractive: candidate.nonInteractive === true,
-    prInput: typeof candidate.prInput === 'string' ? candidate.prInput : undefined,
-    prNumber: typeof candidate.prNumber === 'number' ? Math.trunc(candidate.prNumber) : undefined,
-    prUrl: typeof candidate.prUrl === 'string' ? candidate.prUrl : undefined,
-    prTitle: typeof candidate.prTitle === 'string' ? candidate.prTitle : undefined,
-    baseBranch: typeof candidate.baseBranch === 'string' ? candidate.baseBranch : undefined,
-    headBranch: typeof candidate.headBranch === 'string' ? candidate.headBranch : undefined,
-    author: typeof candidate.author === 'string' ? candidate.author : undefined,
-    provider: typeof candidate.provider === 'string' ? candidate.provider : undefined,
-    linkedEpicKey: typeof candidate.linkedEpicKey === 'string' ? candidate.linkedEpicKey : undefined,
-    openArtifact: typeof candidate.openArtifact === 'boolean' ? candidate.openArtifact : true,
-  };
-}
-
 async function collectReviewPullRequestCommandOptions(
   options: ReviewPullRequestCommandOptions,
   currentBranchContext: CurrentBranchEpicContext,
@@ -4392,42 +4805,9 @@ async function collectReviewPullRequestCommandOptions(
   };
 }
 
-function normalizePullRequestInput(
-  options: ReviewPullRequestCommandOptions,
-): { number?: number; url?: string; provider?: string } | undefined {
-  if (options.prNumber !== undefined) {
-    return {
-      number: options.prNumber,
-      url: options.prUrl,
-      provider: options.provider,
-    };
-  }
-
-  const raw = options.prUrl ?? options.prInput;
-  if (!raw) {
-    return undefined;
-  }
-
-  const normalized = raw.trim();
-  if (/^\d+$/.test(normalized)) {
-    return {
-      number: Number.parseInt(normalized, 10),
-      url: options.prUrl,
-      provider: options.provider,
-    };
-  }
-
-  const githubMatch = normalized.match(/\/pull\/(\d+)(?:\/)?$/i);
-  return {
-    number: githubMatch ? Number.parseInt(githubMatch[1] ?? '0', 10) : undefined,
-    url: normalized,
-    provider: options.provider ?? (githubMatch ? 'github' : undefined),
-  };
-}
-
 function resolveLinkedEpicForPullRequest(
   epics: readonly EpicStatus[],
-  normalizedPr: { number?: number; url?: string; provider?: string },
+  normalizedPr: NormalizedPullRequestInput,
   options: ReviewPullRequestCommandOptions,
   targetEpic: EpicStatus | undefined,
   currentBranchContext: CurrentBranchEpicContext,
@@ -4497,24 +4877,6 @@ function matchesPullRequestBinding(
 
 function buildAiDeliveryRoot(workspaceRoot: string, epicsPath: string): string {
   return path.resolve(workspaceRoot, epicsPath, '..');
-}
-
-function buildPullRequestFolderName(prNumber: number | undefined, prUrl: string | undefined): string {
-  if (prNumber !== undefined) {
-    return `PR-${prNumber}`;
-  }
-  return `PR-${sanitizePathSegment(prUrl ?? 'review')}`;
-}
-
-function sanitizePathSegment(value: string): string {
-  return value.replace(/[^a-zA-Z0-9._-]+/g, '-').replace(/^-+|-+$/g, '').slice(0, 48) || 'review';
-}
-
-function formatPullRequestDisplay(prNumber: number | undefined, prUrl: string | undefined): string {
-  if (prNumber !== undefined) {
-    return `#${prNumber}`;
-  }
-  return prUrl ?? 'PR review';
 }
 
 async function configureMcp(

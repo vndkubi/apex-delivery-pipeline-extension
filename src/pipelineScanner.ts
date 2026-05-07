@@ -2,7 +2,6 @@ import * as fs from 'fs';
 import * as path from 'path';
 import { coordinationMetadataPath, readCoordinationMetadata } from './coordinationModel';
 import {
-  DEFAULT_PHASES,
   EpicStatus,
   PhaseStatus,
   PhaseStatusValue,
@@ -68,7 +67,9 @@ export class PipelineScanner {
     }
 
     const workflow = workflowMetadata.workflow ?? getDefaultWorkflowDefinition();
-    const phases = workflow.phases.map((definition) => {
+    const phases = workflow.phases
+      .filter((definition) => definition.enabled !== false)
+      .map((definition) => {
       const artifactPath = path.join(folderPath, definition.artifact);
       const statusPath = path.join(folderPath, 'phases', definition.id, 'status.json');
       const parsed = this.readPhaseStatus(statusPath);
@@ -78,6 +79,7 @@ export class PipelineScanner {
         name: definition.name,
         owner: definition.owner,
         artifact: definition.artifact,
+        enabled: definition.enabled,
         templateRef: definition.templateRef,
         outputRef: definition.outputRef,
         artifactPath,
@@ -108,6 +110,7 @@ export class PipelineScanner {
       folderPath,
       workflowId: workflow.id,
       workflowName: workflow.name,
+      execution: workflow.execution,
       phases,
       currentPhaseIndex,
       progress,

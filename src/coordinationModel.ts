@@ -122,6 +122,16 @@ export function withBranchBinding(
   });
 }
 
+export function withoutBranchBinding(
+  metadata: EpicCoordinationMetadata,
+  branchName: string,
+): EpicCoordinationMetadata {
+  return sanitizeCoordinationMetadata({
+    ...metadata,
+    branches: metadata.branches.filter((candidate) => candidate.name !== branchName),
+  });
+}
+
 export function withPullRequestBinding(
   metadata: EpicCoordinationMetadata,
   binding: CoordinationPullRequestBinding,
@@ -229,10 +239,9 @@ function mergeCoordinationMetadata(
   const merged = { ...(baseRecord ?? {}) };
   const sanitized = sanitizeCoordinationMetadata(metadata);
 
-  delete merged.worktreePath;
-  delete merged.isCheckedOut;
-  delete merged.dirtyFiles;
-  delete merged.lastObservedAt;
+  for (const field of MACHINE_LOCAL_BRANCH_FIELDS) {
+    delete merged[field];
+  }
 
   merged.schemaVersion = sanitized.schemaVersion;
   merged.epicKey = sanitized.epicKey;

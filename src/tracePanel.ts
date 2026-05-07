@@ -24,7 +24,7 @@ export interface PhaseRunTraceEntry {
   phaseId: string;
   phaseName: string;
   artifactPath: string;
-  executionPath: 'agent-chat' | 'direct-model' | 'chat-fallback' | 'artifact-proposal';
+  executionPath: 'agent-chat' | 'direct-model' | 'chat-fallback' | 'artifact-proposal' | 'cli-handoff';
   result: string;
   prompt: string;
   contextFiles: readonly string[];

@@ -160,8 +160,11 @@ Expected output sample:
 .github/
   copilot-instructions.md
   prompts/apex-delivery.prompt.md
+  prompts/apex-tdd-epic.prompt.md
   instructions/apex-delivery.instructions.md
+  instructions/apex-tdd-micro-commit.instructions.md
   agents/apex-delivery-orchestrator.agent.md
+  agents/apex-tdd-epic-executor.agent.md
   skills/apex-delivery/SKILL.md
 ```
 

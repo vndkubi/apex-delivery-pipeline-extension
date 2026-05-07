@@ -13,12 +13,38 @@ export interface BootstrapResult {
   workflowName: string;
 }
 
+export interface CreateEpicOptions {
+  title: string;
+  owner: string;
+  initialPhaseNote?: string;
+}
+
 export function createSampleEpic(
   workspaceRoot: string,
   epicsRelativePath: string,
   templateRoot: string,
   owner: string,
   workflowDefinition: WorkflowDefinition,
+): BootstrapResult {
+  return createWorkflowEpic(
+    workspaceRoot,
+    epicsRelativePath,
+    templateRoot,
+    workflowDefinition,
+    {
+      title: 'AI Delivery Pipeline Pilot',
+      owner,
+      initialPhaseNote: 'Sample epic created. Start with this workflow entry phase.',
+    },
+  );
+}
+
+export function createWorkflowEpic(
+  workspaceRoot: string,
+  epicsRelativePath: string,
+  templateRoot: string,
+  workflowDefinition: WorkflowDefinition,
+  options: CreateEpicOptions,
 ): BootstrapResult {
   const epicsDir = path.resolve(workspaceRoot, epicsRelativePath);
   fs.mkdirSync(epicsDir, { recursive: true });
@@ -29,8 +55,8 @@ export function createSampleEpic(
 
   const context: TemplateContext = {
     epicKey,
-    title: 'AI Delivery Pipeline Pilot',
-    owner,
+    title: options.title,
+    owner: options.owner,
     date: new Date().toISOString().slice(0, 10),
   };
 
@@ -42,13 +68,13 @@ export function createSampleEpic(
     writeFromTemplate(workspaceRoot, templateRoot, resolvePhaseTemplateRef(phase), path.join(folderPath, phase.artifact), context);
     const status = phase.id === firstPhaseId ? 'in_progress' : 'pending';
     const note = phase.id === firstPhaseId
-      ? 'Sample epic created. Start with this workflow entry phase.'
+      ? options.initialPhaseNote ?? 'Workflow created. Start with this entry phase.'
       : 'Waiting for upstream phase completion.';
     writePhaseStatus(
       path.join(folderPath, 'phases', phase.id, 'status.json'),
       phase.id,
       status,
-      owner,
+      options.owner,
       note,
     );
   }

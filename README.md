@@ -23,7 +23,7 @@ This project is optimized for VS Code plus GitHub Copilot Chat. It keeps repo-na
 - Epic-scoped chat routing markers and trace records using `APEX_SESSION=...`.
 - Guided Autopilot commands for phase execution, fully automatic mode, pause, and resume.
 - Workspace workflow editor for `templateRef`, `outputRef`, `starterPromptRef`, and ordered phase definitions.
-- Guided phase profile editor for `autoSubmit`, `agentTag`, `preferredChatAgent`, and `modelFamily`.
+- Guided phase profile editor for `autoSubmit`, `agentTag`, and `preferredChatAgent`.
 - Direct artifact rewrite proposal flow with diff preview and explicit apply or reject.
 - Git branch-to-epic linking, linked branch worktree opening, and repo-local PR review artifact generation.
 - Developer Trace Panel with prompts, context files, execution path, fallback reason, role notes, and transport metadata.
@@ -72,8 +72,11 @@ Generated Copilot bootstrap pack:
 .github/
   copilot-instructions.md
   prompts/apex-delivery.prompt.md
+  prompts/apex-tdd-epic.prompt.md
   instructions/apex-delivery.instructions.md
+  instructions/apex-tdd-micro-commit.instructions.md
   agents/apex-delivery-orchestrator.agent.md
+  agents/apex-tdd-epic-executor.agent.md
   skills/apex-delivery/SKILL.md
 ```
 
@@ -102,7 +105,7 @@ The bootstrap pack is no-overwrite by default. Existing `.github/` files are ski
 5. Run **Run Phase with Copilot** to use direct model execution or the scoped Copilot Chat handoff.
 6. Use **Propose Artifact Update** when you want a reviewable diff instead of an immediate chat-driven rewrite.
 7. Inspect **Open Developer Trace Panel** when you need the exact prompt, context set, execution path, or fallback reason.
-8. Run **Configure Phase Profile** when a single phase needs different auto-submit, agent tag, or model-family defaults.
+8. Run **Configure Phase Profile** when a single phase needs different auto-submit, agent tag, or preferred-agent defaults.
 9. Use **Review Pull Request** or **Generate PR Review Artifact** when review output should land back into the epic's repo-local artifacts.
 10. Run **Run Guided Autopilot** or **Run Fully Automatic Autopilot** from the Command Palette when the current phase policy allows it.
 11. Use **Pause Guided Autopilot** or **Resume Guided Autopilot** when the flow requires human review or a later continuation.
@@ -122,7 +125,7 @@ The bootstrap pack is no-overwrite by default. Existing `.github/` files are ski
 | **Review Pull Request** | Review a pull request in the context of the linked epic workflow |
 | **Generate PR Review Artifact** | Materialize repo-local review artifacts for a pull request against the linked epic |
 | **Open or Create Artifact** | Open the current artifact or seed it from the configured template |
-| **Configure Phase Profile** | Set per-phase `autoSubmit`, `agentTag`, `preferredChatAgent`, and `modelFamily` overrides |
+| **Configure Phase Profile** | Set per-phase `autoSubmit`, `agentTag`, and `preferredChatAgent` overrides |
 | **Configure Workflows** | Edit workspace workflow definitions, templates, and file-backed prompt sources |
 | **Run Phase with Copilot** | Execute the active phase with direct model access or scoped chat fallback |
 | **Run Guided Autopilot** | Continue through autopilot-enabled phases using the configured execution mode |
@@ -178,7 +181,6 @@ Representative workflow definition:
             "autoSubmit": false,
             "agentTag": "#workflow-investigate",
             "preferredChatAgent": "Workflow Analyst",
-            "modelFamily": "gpt-4.1",
             "starterPromptRef": "docs/ai-delivery/prompts/investigate-starter.md"
           },
           "autopilot": {
@@ -205,7 +207,7 @@ Important behavior:
 
 - The prepared prompt includes an `APEX_SESSION=...` marker so the same epic can keep a consistent conversation identity in trace and fallback flows.
 - If a fallback chat session already exists for the same epic, rerunning the phase reopens that stored epic-scoped session instead of issuing a fresh ask-mode chat launch. When the public chat surface cannot prefill the reopened session deterministically, the scoped prompt is copied for manual continuation.
-- `preferredChatAgent` and `modelFamily` are best-effort hints in public GitHub Copilot Chat launches. The public chat-open commands do not guarantee hard agent or model locking.
+- `preferredChatAgent` is a best-effort hint in public GitHub Copilot Chat launches. The public chat-open commands do not guarantee hard agent locking.
 - The optional `@apex` participant is still available for follow-up, but the primary handoff flow does not depend on it.
 
 ## Guided Autopilot

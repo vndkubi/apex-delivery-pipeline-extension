@@ -5,16 +5,21 @@ import {
   type PhaseAutopilotPolicy,
   type PhaseDefinition,
   type PhaseSessionDefaults,
+  isStarterPromptPlacement,
+  isWorkflowExecutionMode,
+  type WorkflowExecutionPolicy,
 } from './pipelineModel';
 import { validateTemplateRef } from './templateRef';
 import { readWorkspaceTextRef, validateWorkspaceTextRef } from './workspaceTextRef';
 
 export const DEFAULT_WORKFLOW_ID = 'default';
+export const PBI_DELIVERY_WORKFLOW_ID = 'pbi-delivery';
 export const EPIC_WORKFLOW_METADATA_FILE = '.apex-workflow.json';
 
 export interface WorkflowDefinition {
   id: string;
   name: string;
+  execution?: WorkflowExecutionPolicy;
   phases: readonly PhaseDefinition[];
   source: 'built-in' | 'workspace' | 'snapshot';
 }
@@ -31,6 +36,7 @@ export interface WorkflowParseOptions {
 interface EpicWorkflowMetadata {
   workflowId: string;
   workflowName: string;
+  execution?: WorkflowExecutionPolicy;
   phases: readonly PhaseDefinition[];
   createdAt: string;
 }
@@ -44,8 +50,129 @@ export function getDefaultWorkflowDefinition(): WorkflowDefinition {
   };
 }
 
+export function getPbiDeliveryWorkflowDefinition(): WorkflowDefinition {
+  return {
+    id: PBI_DELIVERY_WORKFLOW_ID,
+    name: 'PBI Delivery',
+    execution: {
+      mode: 'pinned',
+      commands: {
+        runPhase: 'pinned',
+        reviewPullRequest: 'pinned',
+        openWorkspace: 'pinned',
+      },
+    },
+    phases: [
+      {
+        id: 'intake',
+        name: 'Intake',
+        owner: 'BA',
+        artifact: 'PBI.md',
+        gate: 'Gate 1',
+        output: 'Problem statement, acceptance criteria, unknowns, source links, and intake triage.',
+        sessionDefaults: {
+          preferredChatAgent: 'Business Analyst',
+          starterPrompt: 'Normalize the request into goal, constraints, acceptance criteria, unknowns, dependencies, and readiness questions before implementation.',
+        },
+      },
+      {
+        id: 'investigation',
+        name: 'Investigation',
+        owner: 'BA',
+        artifact: 'INVESTIGATION.md',
+        gate: 'Gate 1',
+        output: 'Relevant codebase flows, dependencies, risks, exception paths, and affected modules.',
+        sessionDefaults: {
+          preferredChatAgent: 'Business Analyst',
+          starterPrompt: 'Trace the current behavior from entry point to side effects, then call out gaps, assumptions, and investigation risks explicitly.',
+        },
+      },
+      {
+        id: 'code-flow',
+        name: 'Code Flow',
+        owner: 'Tech Lead',
+        artifact: 'CODE-FLOW.md',
+        gate: 'Gate 2',
+        output: 'Entry points, control flow, integrations, exception handlers, and test coverage notes.',
+        sessionDefaults: {
+          preferredChatAgent: 'Tech Lead',
+          starterPrompt: 'Explain the concrete request or execution flow, including data movement, exception handling, retries, and existing test touchpoints.',
+        },
+      },
+      {
+        id: 'design-decision',
+        name: 'Design Decision',
+        owner: 'Tech Lead',
+        artifact: 'DESIGN-DECISION.md',
+        gate: 'Gate 2',
+        output: 'Selected design, rejected options, risks, migration impact, and rollback plan.',
+        sessionDefaults: {
+          preferredChatAgent: 'Tech Lead',
+          starterPrompt: 'Compare viable implementation options, choose one, and record why it is the right tradeoff for this PBI.',
+        },
+      },
+      {
+        id: 'test-decision',
+        name: 'Test Decision',
+        owner: 'QA',
+        artifact: 'TEST-DECISION.md',
+        gate: 'Gate 2',
+        output: 'Chosen test levels, edge cases, exception coverage, and evidence expectations.',
+        sessionDefaults: {
+          preferredChatAgent: 'QA',
+          starterPrompt: 'Decide the narrowest tests that prove the change, capture edge cases, and explain what will not be tested and why.',
+        },
+      },
+      {
+        id: 'tdd-implementation',
+        name: 'TDD Implementation',
+        owner: 'Developer',
+        artifact: 'TDD-PLAN.md',
+        gate: 'Gate 2',
+        output: 'Slice plan, red-green-refactor evidence, changed files, and implementation notes.',
+        sessionDefaults: {
+          preferredChatAgent: 'Developer',
+          starterPrompt: 'Execute the implementation as small TDD slices and keep red, green, refactor, and evidence clearly separated.',
+        },
+      },
+      {
+        id: 'pbi-review',
+        name: 'PBI Review',
+        owner: 'Reviewer',
+        artifact: 'PBI-REVIEW.md',
+        gate: 'Gate 2',
+        output: 'PBI-aware review findings, requirement coverage, design drift, and residual risk.',
+        sessionDefaults: {
+          preferredChatAgent: 'Code Reviewer',
+          starterPrompt: 'Review the change against the PBI intent, acceptance criteria, design decision, and test decision instead of diff-only review.',
+        },
+      },
+      {
+        id: 'evidence-ready',
+        name: 'Evidence Ready',
+        owner: 'Release Manager',
+        artifact: 'EVIDENCE.md',
+        gate: 'Gate 3',
+        output: 'Evidence pack, commands run, review readiness, rollout notes, and unresolved gaps.',
+        sessionDefaults: {
+          preferredChatAgent: 'Release Manager',
+          starterPrompt: 'Package the final evidence for handoff: requirements, implementation, validation, review, residual risks, and release notes.',
+        },
+      },
+    ],
+    source: 'built-in',
+  };
+}
+
+export function getBuiltInWorkflowDefinitions(): readonly WorkflowDefinition[] {
+  return [
+    getDefaultWorkflowDefinition(),
+    getPbiDeliveryWorkflowDefinition(),
+  ];
+}
+
 export function parseWorkflowDefinitions(raw: unknown, options: WorkflowParseOptions = {}): WorkflowDefinitionsResult {
-  const workflows: WorkflowDefinition[] = [getDefaultWorkflowDefinition()];
+  const workflows: WorkflowDefinition[] = [...getBuiltInWorkflowDefinitions()];
   const errors: string[] = [];
 
   if (!isRecord(raw)) {
@@ -82,6 +209,11 @@ function parseWorkflowDefinition(
     return { error: `Workflow "${workflowId}" must include a non-empty name.` };
   }
 
+  const parsedExecution = parseWorkflowExecutionPolicy(workflowId, value.execution);
+  if ('error' in parsedExecution) {
+    return parsedExecution;
+  }
+
   if (!Array.isArray(value.phases) || value.phases.length === 0) {
     return { error: `Workflow "${workflowId}" must include a non-empty phases array.` };
   }
@@ -106,10 +238,56 @@ function parseWorkflowDefinition(
     workflow: {
       id: workflowId,
       name: rawName,
+      execution: parsedExecution.execution,
       phases,
       source: 'workspace',
     },
   };
+}
+
+function parseWorkflowExecutionPolicy(
+  workflowId: string,
+  rawExecution: unknown,
+): { execution?: WorkflowExecutionPolicy } | { error: string } {
+  if (rawExecution === undefined) {
+    return {};
+  }
+
+  if (!isRecord(rawExecution)) {
+    return { error: `Workflow "${workflowId}" execution must be an object.` };
+  }
+
+  const execution: WorkflowExecutionPolicy = {};
+  if (rawExecution.mode !== undefined) {
+    if (!isWorkflowExecutionMode(rawExecution.mode)) {
+      return { error: `Workflow "${workflowId}" execution.mode must be one of control, pooled, or pinned.` };
+    }
+    execution.mode = rawExecution.mode;
+  }
+
+  if (rawExecution.commands !== undefined) {
+    if (!isRecord(rawExecution.commands)) {
+      return { error: `Workflow "${workflowId}" execution.commands must be an object.` };
+    }
+
+    const commands: NonNullable<WorkflowExecutionPolicy['commands']> = {};
+    for (const fieldName of ['runPhase', 'reviewPullRequest', 'openWorkspace'] as const) {
+      const value = rawExecution.commands[fieldName];
+      if (value === undefined) {
+        continue;
+      }
+      if (!isWorkflowExecutionMode(value)) {
+        return { error: `Workflow "${workflowId}" execution.commands.${fieldName} must be one of control, pooled, or pinned.` };
+      }
+      commands[fieldName] = value;
+    }
+
+    if (Object.keys(commands).length > 0) {
+      execution.commands = commands;
+    }
+  }
+
+  return Object.keys(execution).length > 0 ? { execution } : { execution: {} };
 }
 
 function parsePhaseDefinition(
@@ -128,6 +306,10 @@ function parsePhaseDefinition(
   const artifact = typeof rawPhase.artifact === 'string' ? rawPhase.artifact.trim() : '';
   const gate = typeof rawPhase.gate === 'string' ? rawPhase.gate.trim() : '';
   const output = typeof rawPhase.output === 'string' ? rawPhase.output : '';
+  if (rawPhase.enabled !== undefined && typeof rawPhase.enabled !== 'boolean') {
+    return { error: `Workflow "${workflowId}" phase "${id || `phase-${index + 1}`}" enabled must be a boolean when provided.` };
+  }
+  const enabled = rawPhase.enabled === undefined ? true : rawPhase.enabled === true;
 
   const parsedOutputRef = parseWorkspaceTextRefField(workflowId, id || `phase-${index + 1}`, 'outputRef', rawPhase.outputRef);
   if ('error' in parsedOutputRef) {
@@ -164,6 +346,7 @@ function parsePhaseDefinition(
       name,
       owner,
       artifact,
+      ...(enabled ? {} : { enabled: false }),
       templateRef: parsedTemplateRef.templateRef,
       outputRef: parsedOutputRef.value,
       gate,
@@ -285,6 +468,13 @@ function parsePhaseSessionDefaults(
     sessionDefaults.starterPromptRef = starterPromptRef.value;
   }
 
+  if (rawDefaults.starterPromptPlacement !== undefined) {
+    if (!isStarterPromptPlacement(rawDefaults.starterPromptPlacement)) {
+      return { error: `Workflow "${workflowId}" phase "${phaseId}" sessionDefaults.starterPromptPlacement must be prepend, append, or replace.` };
+    }
+    sessionDefaults.starterPromptPlacement = rawDefaults.starterPromptPlacement;
+  }
+
   return Object.keys(sessionDefaults).length > 0 ? { sessionDefaults } : {};
 }
 
@@ -374,6 +564,7 @@ export function writeWorkflowMetadata(epicFolderPath: string, workflow: Workflow
   const metadata: EpicWorkflowMetadata = {
     workflowId: workflow.id,
     workflowName: workflow.name,
+    ...(workflow.execution ? { execution: workflow.execution } : {}),
     phases: workflow.phases,
     createdAt: new Date().toISOString(),
   };
@@ -401,6 +592,7 @@ export function readWorkflowMetadata(epicFolderPath: string): { workflow?: Workf
 
     const parsed = parseWorkflowDefinition(workflowId, {
       name: workflowName,
+      execution: raw.execution,
       phases: raw.phases,
     });
     if ('error' in parsed) {

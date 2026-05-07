@@ -3,6 +3,10 @@
     "module": "commonjs",
     "target": "ES2022",
     "outDir": "out",
+    "types": [
+      "node",
+      "vscode"
+    ],
     "lib": [
       "ES2022"
     ],
@@ -10,6 +14,8 @@
     "rootDir": "src",
     "strict": true,
     "noImplicitReturns": true,
+    "noUnusedLocals": true,
+    "noUnusedParameters": true,
     "noFallthroughCasesInSwitch": true,
     "noUncheckedIndexedAccess": true,
     "esModuleInterop": true,

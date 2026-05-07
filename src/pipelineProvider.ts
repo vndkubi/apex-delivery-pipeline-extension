@@ -53,7 +53,7 @@ export class PipelineProvider implements vscode.TreeDataProvider<TreeNode> {
 export class EpicItem extends vscode.TreeItem {
   constructor(readonly epic: EpicStatus) {
     super(epic.key, vscode.TreeItemCollapsibleState.Collapsed);
-    this.description = `${epic.progress}% - ${currentPhaseLabel(epic)} - ${epic.workflowName}`;
+    this.description = `${epic.progress}% - ${currentPhaseLabel(epic)} - ${branchSummary(epic)} - ${epic.workflowName}`;
     this.tooltip = new vscode.MarkdownString(buildEpicTooltip(epic));
     this.contextValue = 'epic';
     this.iconPath = iconForEpic(epic);
@@ -107,6 +107,7 @@ function buildEpicTooltip(epic: EpicStatus): string {
     `**Title**: ${epic.title}`,
     `**Workflow**: ${epic.workflowName} (${epic.workflowId})`,
     `**Progress**: ${epic.progress}%`,
+    `**Branch health**: ${branchSummary(epic)}`,
     '',
   ];
   if (epic.coordination?.branches.length) {
@@ -146,6 +147,9 @@ function iconForEpic(epic: EpicStatus): vscode.ThemeIcon {
   if (epic.hasBlocked) {
     return new vscode.ThemeIcon('error', new vscode.ThemeColor('testing.iconFailed'));
   }
+  if ((epic.coordination?.branches.length ?? 0) === 0 && epic.progress > 0 && epic.progress < 100) {
+    return new vscode.ThemeIcon('warning', new vscode.ThemeColor('charts.orange'));
+  }
   if (epic.hasAwaitingReview) {
     return new vscode.ThemeIcon('eye', new vscode.ThemeColor('charts.orange'));
   }
@@ -156,6 +160,17 @@ function iconForEpic(epic: EpicStatus): vscode.ThemeIcon {
     return new vscode.ThemeIcon('sync', new vscode.ThemeColor('charts.yellow'));
   }
   return new vscode.ThemeIcon('circle-outline');
+}
+
+function branchSummary(epic: EpicStatus): string {
+  const linkedBranches = epic.coordination?.branches ?? [];
+  if (linkedBranches.length === 0) {
+    return 'unlinked';
+  }
+  if (linkedBranches.length === 1) {
+    return linkedBranches[0]?.name ?? '1 branch';
+  }
+  return `${linkedBranches.length} branches`;
 }
 
 function iconForStatus(status: PhaseStatusValue): vscode.ThemeIcon {
